@@ -6,13 +6,13 @@ class ChatPanel(ctk.CTkFrame):
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(0, weight=1)
 
-        # Khung hiển thị tin nhắn
+        # khung hien thi tin 
         self.chat_display = ctk.CTkTextbox(self, font=ctk.CTkFont(family="Segoe UI", size=15), fg_color="white", text_color="#453284", corner_radius=20)
         self.chat_display.grid(row=0, column=0, columnspan=2, sticky="nsew", pady=(0, 15))
         self.chat_display.insert("end", "Hệ thống: Chào mừng Minh Anh!\n\n")
         self.chat_display.configure(state="disabled")
 
-        # Thanh nhập tin nhắn
+        # thanh tin nhan
         self.input_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.input_frame.grid(row=1, column=0, sticky="ew")
         self.input_frame.grid_columnconfigure(0, weight=1)
