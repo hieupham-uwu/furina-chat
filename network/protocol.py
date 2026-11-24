@@ -1,7 +1,7 @@
 import json
 import socket
 import struct
-
+import time
 from typing import Any, Dict, Optional
 
 import config
@@ -80,19 +80,27 @@ def unpack_udp_hello(data: bytes) -> Optional[Dict[str, Any]]:
         "status": status,
     }
 
-def recv_exact(sock: socket.socket, n: int) -> bytes:
+def recv_exact(
+    sock: socket.socket, n: int, *, deadline: Optional[float] = None
+) -> bytes:
     if n < 0:
         raise ValueError("Byte count must be non-negative")
 
     data = bytearray()
     while len(data) < n:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Time limit for reading the frame expired")
+            sock.settimeout(remaining)
+
         chunk = sock.recv(n - len(data))
         if not chunk:
             raise EOFError(f"Connection closed after {len(data)} of {n} bytes")
+
         data.extend(chunk)
 
     return bytes(data)
-
 
 def _validate_tcp_header(header: Any) -> None:
     if not isinstance(header, dict):
@@ -134,16 +142,19 @@ def _reject_json_constant(value: str) -> None:
     raise ValueError(f"Invalid JSON number: {value}")
 
 
-def recv_header(sock: socket.socket) -> Dict[str, Any]:
-    magic = recv_exact(sock, len(config.MAGIC_BYTES))
+def recv_header(
+    sock: socket.socket, *, deadline: Optional[float] = None
+) -> Dict[str, Any]:
+    magic = recv_exact(sock, len(config.MAGIC_BYTES), deadline=deadline)
     if magic != config.MAGIC_BYTES:
         raise ValueError("Invalid TCP magic bytes")
 
-    (header_len,) = struct.unpack("!I", recv_exact(sock, 4))
+    length_bytes = recv_exact(sock, 4, deadline=deadline)
+    (header_len,) = struct.unpack("!I", length_bytes)
     if not 1 <= header_len <= config.MAX_JSON_HEADER_SIZE:
         raise ValueError("Invalid TCP header length")
 
-    raw = recv_exact(sock, header_len)
+    raw = recv_exact(sock, header_len, deadline=deadline)
     try:
         header = json.loads(raw.decode("utf-8"), parse_constant=_reject_json_constant)
     except RecursionError as exc:
