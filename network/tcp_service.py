@@ -2,14 +2,15 @@
 
 Nhiệm vụ:
 - Lắng nghe kết nối, trao đổi HI và lưu một kết nối cho mỗi peer_id.
-- Gửi, nhận MSG và đóng kết nối khi có BYE hoặc lỗi socket.
+- Gửi, nhận MSG và STICKER. Đóng kết nối khi có BYE hoặc lỗi socket.
 - Lấy địa chỉ của peer qua get_peer(peer_id) từ UDP discovery.
 
 Hợp đồng với event_bus: gọi event_bus.publish(tên_sự_kiện, payload).
 Các sự kiện phát ra: chat_connected, chat_disconnected, message_sent,
-message_received và operation_failed.
+message_received, sticker_sent, sticker_received và operation_failed.
 """
 
+import re
 import socket
 import time
 from threading import Lock, Thread
@@ -145,6 +146,14 @@ def _check_chat_text(text):
         raise ValueError("Message is too long")
 
 
+def _sticker_fields(pack, sticker_id):
+    # Dùng mã thư mục và tên ảnh (ví dụ columbina/id_1) làm mã sticker.
+    for field, value in (("pack", pack), ("sticker_id", sticker_id)):
+        if not isinstance(value, str) or re.fullmatch(r"[A-Za-z0-9_-]+", value) is None:
+            raise ValueError(f"Invalid sticker {field}")
+    return {"pack": pack, "sticker_id": sticker_id}
+
+
 def send_chat_message(sock, peer_id, text, bus):
     _check_chat_text(text)
 
@@ -154,6 +163,16 @@ def send_chat_message(sock, peer_id, text, bus):
         "payload_size": 0,
     })
     bus.publish("message_sent", {"peer_id": peer_id, "text": text})
+
+
+def _send_chat_sticker(sock, peer_id, pack, sticker_id, bus):
+    sticker = _sticker_fields(pack, sticker_id)
+    send_packet(sock, {
+        "type": config.TYPE_STICKER,
+        "payload_size": 0,
+        **sticker,
+    })
+    bus.publish("sticker_sent", {"peer_id": peer_id, **sticker})
 
 
 def receive_chat_message(sock, peer_id, bus):
@@ -287,21 +306,29 @@ class TCPService:
 
     def send_message(self, peer_id, text):
         """Gửi một frame MSG qua kết nối đang dùng với peer."""
+        self._send_on_chat(peer_id, "send_message", send_chat_message, text)
+
+    def send_sticker(self, peer_id, pack, sticker_id):
+        """Gửi mã sticker qua kết nối chat để bên nhận tra ảnh cục bộ."""
+        self._send_on_chat(peer_id, "send_sticker", _send_chat_sticker, pack, sticker_id)
+
+    def _send_on_chat(self, peer_id, operation, send_frame, *fields):
         chat = self._get_chat(peer_id)
         if chat is None:
-            self._failed("send_message", peer_id, "Chat is not connected")
+            self._failed(operation, peer_id, "Chat is not connected")
             return
 
+        # MSG và STICKER dùng cùng khóa gửi với BYE.
         with chat.send_lock:
             if self._get_chat(peer_id) is not chat:
-                self._failed("send_message", peer_id, "Chat connection changed")
+                self._failed(operation, peer_id, "Chat connection changed")
                 return
             try:
-                send_chat_message(chat.sock, peer_id, text, self._bus)
+                send_frame(chat.sock, peer_id, *fields, bus=self._bus)
             except ValueError as error:
-                self._failed("send_message", peer_id, error)
+                self._failed(operation, peer_id, error)
             except OSError as error:
-                self._failed("send_message", peer_id, error)
+                self._failed(operation, peer_id, error)
                 self._disconnect(peer_id, chat, str(error))
 
     def leave_chat(self, peer_id):
@@ -406,19 +433,27 @@ class TCPService:
         try:
             while True:
                 header = recv_header(chat.sock)
-                if header["type"] == config.TYPE_BYE:
+                frame_type = header["type"]
+                if frame_type == config.TYPE_BYE:
                     reason = "peer_left"
                     break
 
-                if header["type"] != config.TYPE_MSG:
-                    raise ValueError("Expected a MSG or BYE frame")
+                if frame_type == config.TYPE_MSG:
+                    text = header.get("text")
+                    _check_chat_text(text)
+                    event_name = "message_received"
+                    payload = {"peer_id": peer_id, "text": text}
+                elif frame_type == config.TYPE_STICKER:
+                    sticker = _sticker_fields(header.get("pack"), header.get("sticker_id"))
+                    event_name = "sticker_received"
+                    payload = {"peer_id": peer_id, **sticker}
+                else:
+                    raise ValueError("Expected a MSG, STICKER or BYE frame")
 
-                text = header.get("text")
-                _check_chat_text(text)
                 with self._lock:
                     if self._chats.get(peer_id) is not chat:
                         break
-                    self._bus.publish("message_received", {"peer_id": peer_id, "text": text})
+                    self._bus.publish(event_name, payload)
         except EOFError:
             pass
         except (OSError, ValueError) as error:
