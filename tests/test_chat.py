@@ -1,13 +1,15 @@
+import socket
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from queue import Queue
 from threading import Barrier, Event
 from unittest.mock import patch
 
 import config
 from core.event_bus import EventBus
 from network import tcp_service
-from network.protocol import send_packet
+from network.protocol import recv_exact, recv_header, send_packet
 from network.tcp_service import TCPService
 
 
@@ -17,14 +19,29 @@ class ChatTests(unittest.TestCase):
         self.duong, self.duong_bus = self.start_peer(1, "Dương")
         self.hieu, self.hieu_bus = self.start_peer(2, "Hiếu")
 
-    def start_peer(self, number, name):
+    def start_peer(self, number, name, *, on_media=None):
         peer_id = f"00000000-0000-0000-0000-{number:012d}"
         bus = EventBus()
-        service = TCPService(peer_id, name, self.addresses.get, bus, host="127.0.0.1")
+        service = TCPService(
+            peer_id, name, self.addresses.get, bus, host="127.0.0.1", on_media=on_media,
+        )
         self.addCleanup(service.stop)
         port = service.start()
         self.addresses[peer_id] = {"ip": "127.0.0.1", "tcp_port": port}
         return service, bus
+
+    def connect_for_media(self, receiver, *, purpose="media"):
+        sock = socket.create_connection(("127.0.0.1", receiver.tcp_port), timeout=3)
+        self.addCleanup(sock.close)
+        send_packet(sock, {
+            "type": config.TYPE_HI,
+            "peer_id": self.duong.peer_id,
+            "name": self.duong.peer_name,
+            "tcp_port": self.duong.tcp_port,
+            "purpose": purpose,
+            "payload_size": 0,
+        })
+        return sock
 
     def wait_for(self, condition):
         deadline = time.monotonic() + 3
@@ -199,6 +216,114 @@ class ChatTests(unittest.TestCase):
         self.hieu.stop()
         self.wait_for_event(self.duong_bus, "chat_disconnected", self.hieu.peer_id)
         self.assertIsNone(self.duong._get_chat(self.hieu.peer_id))
+
+
+    def test_media_handoff_leaves_chat_available(self):
+        media_started = Event()
+        received_media = Queue()
+        transfer_id = "550e8400-e29b-41d4-a716-446655440000"
+
+        def handle_incoming(sock, peer_id):
+            with sock:
+                media_started.set()
+                header = recv_header(sock)
+                payload = recv_exact(sock, header["payload_size"])
+                received_media.put((peer_id, header, payload))
+                send_packet(sock, {
+                    "type": config.TYPE_FILE_OK,
+                    "transfer_id": header["transfer_id"],
+                    "payload_size": 0,
+                })
+
+        receiver, receiver_bus = self.start_peer(3, "Mai", on_media=handle_incoming)
+        self.duong.open_chat(receiver.peer_id)
+        self.wait_for_event(receiver_bus, "chat_connected", self.duong.peer_id)
+
+        media = self.connect_for_media(receiver)
+        self.assertTrue(media_started.wait(3))
+        self.duong.send_message(receiver.peer_id, "Chat trong khi chờ dữ liệu tệp")
+        event = self.wait_for(receiver_bus.poll)
+        self.assertEqual(event.name, "message_received")
+        self.assertEqual(event.payload["text"], "Chat trong khi chờ dữ liệu tệp")
+
+        header = {
+            "type": config.TYPE_FILE,
+            "transfer_id": transfer_id,
+            "filename": "note.txt",
+            "payload_size": 3,
+        }
+        send_packet(media, header, b"ABC")
+        self.assertEqual(recv_header(media), {
+            "type": config.TYPE_FILE_OK,
+            "transfer_id": transfer_id,
+            "payload_size": 0,
+        })
+        self.assertEqual(received_media.get(timeout=3), (self.duong.peer_id, header, b"ABC"))
+
+    def test_media_without_handler_closes_only_media_connection(self):
+        media = self.connect_for_media(self.hieu)
+        event = self.wait_for(self.hieu_bus.poll)
+        self.assertEqual(event.name, "operation_failed")
+        self.assertEqual(event.payload, {
+            "operation": "accept_media",
+            "peer_id": self.duong.peer_id,
+            "reason": "No media handler is configured",
+        })
+        self.assertEqual(media.recv(1), b"")
+
+        self.duong.open_chat(self.hieu.peer_id)
+        self.wait_for_event(self.hieu_bus, "chat_connected", self.duong.peer_id)
+
+    def test_invalid_hi_purpose_does_not_reach_media_handler(self):
+        handler_called = Event()
+
+        def handle_incoming(sock, peer_id):
+            with sock:
+                handler_called.set()
+
+        receiver, receiver_bus = self.start_peer(3, "Mai", on_media=handle_incoming)
+        sock = self.connect_for_media(receiver, purpose="unknown")
+        event = self.wait_for(receiver_bus.poll)
+        self.assertEqual(event.name, "operation_failed")
+        self.assertEqual(event.payload["reason"], "Expected a chat or media HI frame")
+        self.assertEqual(sock.recv(1), b"")
+        self.assertFalse(handler_called.is_set())
+
+    def test_media_handler_failure_closes_socket(self):
+        def handle_incoming(sock, peer_id):
+            raise RuntimeError("File handler stopped")
+
+        receiver, receiver_bus = self.start_peer(3, "Mai", on_media=handle_incoming)
+        media = self.connect_for_media(receiver)
+        event = self.wait_for(receiver_bus.poll)
+        self.assertEqual(event.name, "operation_failed")
+        self.assertEqual(event.payload, {
+            "operation": "handle_media",
+            "peer_id": self.duong.peer_id,
+            "reason": "File handler stopped",
+        })
+        self.assertEqual(media.recv(1), b"")
+
+    def test_stop_leaves_handed_off_socket_with_media_handler(self):
+        media_sockets = Queue()
+
+        def handle_incoming(sock, peer_id):
+            media_sockets.put(sock)
+
+        receiver, receiver_bus = self.start_peer(3, "Mai", on_media=handle_incoming)
+        media = self.connect_for_media(receiver)
+        accepted = media_sockets.get(timeout=3)
+        self.addCleanup(accepted.close)
+
+        receiver.stop()
+        accepted.settimeout(3)
+        media.sendall(b"A")
+        self.assertEqual(recv_exact(accepted, 1), b"A")
+
+        port = receiver.start()
+        self.addresses[receiver.peer_id] = {"ip": "127.0.0.1", "tcp_port": port}
+        self.duong.open_chat(receiver.peer_id)
+        self.wait_for_event(receiver_bus, "chat_connected", self.duong.peer_id)
 
 
 if __name__ == "__main__":
