@@ -1,5 +1,27 @@
 from typing import Tuple
 
+# UDP message types
+TYPE_HELLO = "HELLO"
+
+# TCP handshake & chat types
+TYPE_HI = "HI"
+TYPE_MSG = "MSG"
+TYPE_STICKER = "STICKER"
+TYPE_BYE = "BYE"
+
+# TCP media types
+TYPE_FILE = "FILE"
+TYPE_IMAGE = "IMAGE"
+TYPE_FILE_OK = "FILE_OK"
+TYPE_FILE_ERROR = "FILE_ERROR"
+
+# Nhóm hợp lệ để kiểm tra nhanh khi validate frame
+CHAT_TYPES = {TYPE_MSG, TYPE_STICKER, TYPE_BYE}
+MEDIA_DATA_TYPES = {TYPE_FILE, TYPE_IMAGE}
+MEDIA_ACK_TYPES = {TYPE_FILE_OK, TYPE_FILE_ERROR}
+ALL_TCP_TYPES = {TYPE_HI} | CHAT_TYPES | MEDIA_DATA_TYPES | MEDIA_ACK_TYPES
+
+
 # ==============================================================================
 # 1. UDP Discovery
 # ==============================================================================
