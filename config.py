@@ -1,15 +1,19 @@
 from typing import Tuple
 
-# UDP message types
+
+# ==============================================================================
+# 1. Loại message dùng chung (UDP + TCP)
+# ==============================================================================
+# UDP discovery
 TYPE_HELLO = "HELLO"
 
-# TCP handshake & chat types
+# TCP handshake & chat
 TYPE_HI = "HI"
 TYPE_MSG = "MSG"
 TYPE_STICKER = "STICKER"
 TYPE_BYE = "BYE"
 
-# TCP media types
+# TCP media
 TYPE_FILE = "FILE"
 TYPE_IMAGE = "IMAGE"
 TYPE_FILE_OK = "FILE_OK"
@@ -23,7 +27,21 @@ ALL_TCP_TYPES = {TYPE_HI} | CHAT_TYPES | MEDIA_DATA_TYPES | MEDIA_ACK_TYPES
 
 
 # ==============================================================================
-# 1. UDP Discovery
+# 2. Trạng thái peer & tên sự kiện (event_bus)
+# ==============================================================================
+STATUS_ONLINE = "online"
+STATUS_AWAY = "away"
+VALID_STATUSES = (STATUS_ONLINE, STATUS_AWAY)
+
+EVENT_PEER_UPDATED = "peer_updated"
+EVENT_PEER_OFFLINE = "peer_offline"
+
+# Các trường công khai của một peer (bỏ last_seen khi trả ra ngoài)
+PEER_FIELDS: Tuple[str, ...] = ("peer_id", "name", "ip", "tcp_port", "status")
+
+
+# ==============================================================================
+# 3. UDP Discovery
 # ==============================================================================
 # Cổng lắng nghe và gửi gói tin UDP discovery
 UDP_DISCOVERY_PORT: int = 9999
@@ -40,9 +58,21 @@ HELLO_INTERVAL: float = 3.0
 # Thời gian hết hạn discovery kể từ gói HELLO hợp lệ cuối cùng (giây)
 DISCOVERY_TIMEOUT: float = 10.0
 
+# Chu kỳ quét peer hết hạn của luồng Sweeper (giây)
+UDP_SWEEP_INTERVAL: float = 1.0
+
+# Kích thước bộ đệm đọc gói UDP (byte)
+UDP_RECV_BUFFER_SIZE: int = 4096
+
+# Timeout của socket UDP để Listener thường xuyên kiểm tra tín hiệu dừng (giây)
+UDP_RECV_TIMEOUT: float = 1.0
+
+# Thời gian chờ tối đa khi join các luồng nền của UDPService (giây)
+UDP_JOIN_TIMEOUT: float = 2.0
+
 
 # ==============================================================================
-# 2. Kết nối TCP
+# 4. Kết nối TCP
 # ==============================================================================
 # Địa chỉ lắng nghe mặc định cho TCP server
 DEFAULT_TCP_HOST: str = "0.0.0.0"
@@ -54,7 +84,7 @@ DEFAULT_TCP_PORT: int = 0
 
 
 # ==============================================================================
-# 3. Định dạng Frame & Giới hạn dữ liệu
+# 5. Định dạng Frame & Giới hạn dữ liệu
 # ==============================================================================
 # Chuỗi byte nhận diện giao thức (Magic bytes), dài 6 byte
 MAGIC_BYTES: bytes = b"Furina"
@@ -71,7 +101,7 @@ FILE_CHUNK_SIZE: int = 65_536  # 64 KiB
 
 
 # ==============================================================================
-# 4. Thời gian chờ (Timeouts)
+# 6. Thời gian chờ (Timeouts)
 # ==============================================================================
 # Thời hạn tối đa để nhận trọn vẹn một frame HI (giây)
 HI_FRAME_TIMEOUT: float = 5.0

@@ -1,34 +1,22 @@
-"""Định dạng gói tin UDP discovery (HELLO).
-
-Gói HELLO được gửi thẳng dưới dạng chuỗi JSON UTF-8 tới
-255.255.255.255:9999 (xem ``config.UDP_BROADCAST_ADDR``),
-KHÔNG bọc trong khung TCP (magic bytes + JSON header).
-
-Ví dụ nội dung gói:
-
-    {
-      "type": "HELLO",
-      "peer_id": "550e8400-e29b-41d4-a716-446655440000",
-      "name": "Quan",
-      "tcp_port": 5000,
-      "status": "online"
-    }
-"""
-
 import json
 from typing import Any, Dict, Optional
 
 import config
 
-# Chỉ hai giá trị trạng thái hợp lệ theo giao thức
-VALID_STATUSES = ("online", "away")
+# {
+#     "type": "HELLO",
+#     "peer_id": "550e8400-e29b-41d4-a716-446655440000",
+#     "name": "Quan",
+#     "tcp_port": 5000,
+#     "status": "online",
+# }
 
 
 def pack_udp_hello(
     peer_id: str,
     name: str,
     tcp_port: int,
-    status: str = "online",
+    status: str = config.STATUS_ONLINE,
 ) -> bytes:
 
     if not isinstance(peer_id, str) or not peer_id.strip():
@@ -41,7 +29,7 @@ def pack_udp_hello(
         or not 1 <= tcp_port <= 65535
     ):
         raise ValueError(f"tcp_port must be an int in 1..65535, got {tcp_port!r}")
-    if status not in VALID_STATUSES:
+    if status not in config.VALID_STATUSES:
         raise ValueError(f"status must be 'online' or 'away', got {status!r}")
 
     payload = {
@@ -55,15 +43,6 @@ def pack_udp_hello(
 
 
 def unpack_udp_hello(data: bytes) -> Optional[Dict[str, Any]]:
-    """Giải mã và kiểm tra một gói tin UDP discovery.
-
-    Args:
-        data: Dữ liệu thô nhận được từ socket UDP.
-
-    Returns:
-        Dict chứa các trường hợp lệ của gói HELLO, hoặc ``None`` nếu
-        dữ liệu không phải JSON, không phải HELLO, hoặc sai định dạng.
-    """
     try:
         msg = json.loads(data.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
@@ -87,7 +66,7 @@ def unpack_udp_hello(data: bytes) -> Optional[Dict[str, Any]]:
         or not 1 <= tcp_port <= 65535
     ):
         return None
-    if status not in VALID_STATUSES:
+    if status not in config.VALID_STATUSES:
         return None
 
     return {
