@@ -1,7 +1,3 @@
-"""
-Cấu hình thông số và định danh cho giao thức truyền thông.
-"""
-
 from typing import Tuple
 
 # ==============================================================================
