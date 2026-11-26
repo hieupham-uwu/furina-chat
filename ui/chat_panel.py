@@ -5,16 +5,19 @@ from tkinter import filedialog
 import customtkinter as ctk
 from PIL import Image
 import config
-from ui.sticker_picker import StickerPopup, _get_stickers_dir
+from ui.sticker_picker import _get_stickers_dir
 
-MAX_MSG_CHARS = getattr(config, "MAX_MSG_CHARS", 4000)
+MAX_MSG_CHARS = 4000
+TYPE_MSG = getattr(config, "TYPE_MSG", "MSG")
+TYPE_STICKER = getattr(config, "TYPE_STICKER", "STICKER")
+TYPE_IMAGE = getattr(config, "TYPE_IMAGE", "IMAGE")
+TYPE_FILE = getattr(config, "TYPE_FILE", "FILE")
 
 
 def _get_downloads_dir() -> str:
-    for attr in ("DOWNLOADS_DIR", "DOWNLOAD_DIR"):
-        val = getattr(config, attr, None)
-        if val:
-            return val
+    val = getattr(config, "DOWNLOADS_DIR", None)
+    if val:
+        return str(val)
     dir_name = getattr(config, "DOWNLOADS_DIR_NAME", "downloads")
     if os.path.isabs(dir_name):
         return dir_name
@@ -39,14 +42,44 @@ def _open_local_path(path: str) -> bool:
 
 
 class ChatPanel(ctk.CTkFrame):
-    def __init__(self, master, controller, **kwargs):
+    def __init__(self, master, controller, on_toggle_sticker_cb=None, **kwargs):
         kwargs.setdefault("fg_color", "transparent")
         super().__init__(master, **kwargs)
         self.controller = controller
+        self.on_toggle_sticker_cb = on_toggle_sticker_cb
         self._image_cache = []
         self._status_labels = {}
 
-        # Khung tin nhắn lớn trắng bo góc giống giao diện mẫu
+        self.header_bar = ctk.CTkFrame(
+            self, fg_color="#FFFFFF", corner_radius=14, height=42
+        )
+        self.header_bar.pack(fill="x", padx=0, pady=(0, 8))
+        self.header_bar.pack_propagate(False)
+
+        self.header_dot = ctk.CTkLabel(
+            self.header_bar,
+            text="●",
+            font=("Segoe UI", 12, "bold"),
+            text_color="#16A34A",
+        )
+        self.header_dot.pack(side="left", padx=(14, 6))
+
+        self.header_label = ctk.CTkLabel(
+            self.header_bar,
+            text="Chưa chọn cuộc trò chuyện",
+            font=("Segoe UI", 13, "bold"),
+            text_color="#453284",
+        )
+        self.header_label.pack(side="left")
+
+        self.header_status_label = ctk.CTkLabel(
+            self.header_bar,
+            text="",
+            font=("Segoe UI", 11),
+            text_color="#6B7280",
+        )
+        self.header_status_label.pack(side="left", padx=8)
+
         self.messages_scroll = ctk.CTkScrollableFrame(
             self,
             fg_color="#FFFFFF",
@@ -54,10 +87,7 @@ class ChatPanel(ctk.CTkFrame):
         )
         self.messages_scroll.pack(fill="both", expand=True, padx=0, pady=(0, 10))
 
-        # Thanh báo lỗi nhẹ khi cần
-        self.error_banner = ctk.CTkFrame(
-            self, fg_color="#FEDADA", corner_radius=12
-        )
+        self.error_banner = ctk.CTkFrame(self, fg_color="#FEDADA", corner_radius=12)
         self.error_label = ctk.CTkLabel(
             self.error_banner,
             text="",
@@ -78,12 +108,14 @@ class ChatPanel(ctk.CTkFrame):
             command=self.hide_error,
         ).pack(side="right", padx=6)
 
-        # Thanh tiến độ truyền file
         self.progress_frame = ctk.CTkFrame(
             self, height=34, fg_color="#FFFFFF", corner_radius=12
         )
         self.progress_label = ctk.CTkLabel(
-            self.progress_frame, text="", font=("Segoe UI", 11), text_color="#453284"
+            self.progress_frame,
+            text="",
+            font=("Segoe UI", 11),
+            text_color="#453284",
         )
         self.progress_label.pack(side="left", padx=12)
         self.progress_bar = ctk.CTkProgressBar(
@@ -92,7 +124,6 @@ class ChatPanel(ctk.CTkFrame):
         self.progress_bar.pack(side="right", fill="x", expand=True, padx=12)
         self.progress_bar.set(0)
 
-        # Hàng điều khiển phía dưới giống giao diện mẫu: [📎 🖼️ 😊]  [Aa]  [➤]
         self.input_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.input_frame.pack(fill="x", padx=0, pady=(0, 2))
 
@@ -133,10 +164,10 @@ class ChatPanel(ctk.CTkFrame):
             width=34,
             height=34,
             corner_radius=10,
-            fg_color="transparent",
-            hover_color="#C6E6FF",
-            text_color="#6A49FA",
-            command=self._toggle_sticker_popup,
+            fg_color="#EDE9FE",
+            hover_color="#DDD6FE",
+            text_color="#453284",
+            command=self._on_sticker_button_click,
         )
         self.btn_sticker.pack(side="left", padx=(2, 4), pady=3)
 
@@ -147,7 +178,7 @@ class ChatPanel(ctk.CTkFrame):
             fg_color="#FFFFFF",
             border_width=0,
             text_color="#1F2937",
-            placeholder_text="Aa",
+            placeholder_text="Aa (tối đa 4000 ký tự)",
         )
         self.entry_msg.pack(side="left", fill="x", expand=True, padx=(0, 8))
         self.entry_msg.bind("<Return>", self._on_return)
@@ -166,13 +197,27 @@ class ChatPanel(ctk.CTkFrame):
         )
         self.btn_send.pack(side="right")
 
-        # Ô sticker nổi nhỏ ngay phía trên nút sticker (không mở cửa sổ mới)
-        self.sticker_popup = StickerPopup(
-            self, on_select_sticker_cb=self._on_sticker_chosen
-        )
+    def set_header(self, title_text: str, status: str = ""):
+        self.header_label.configure(text=title_text or "Chưa chọn cuộc trò chuyện")
+        st = (status or "").lower()
+        if st == "away":
+            self.header_dot.configure(text_color="#EAB308")
+            self.header_status_label.configure(text="(Away)", text_color="#A16207")
+        elif st == "online":
+            self.header_dot.configure(text_color="#16A34A")
+            self.header_status_label.configure(text="(Online)", text_color="#15803D")
+        elif st == "offline":
+            self.header_dot.configure(text_color="#9CA3AF")
+            self.header_status_label.configure(text="(Offline)", text_color="#6B7280")
+        else:
+            self.header_dot.configure(text_color="#6B7280")
+            self.header_status_label.configure(text="", text_color="#6B7280")
 
     def show_error(self, message: str):
-        self.error_label.configure(text=f"⚠️ {message}")
+        msg = str(message or "Đã xảy ra lỗi.")
+        if not msg.lower().startswith("cảnh báo:"):
+            msg = f"Cảnh báo: {msg}"
+        self.error_label.configure(text=f"⚠️ {msg}")
         if not self.error_banner.winfo_ismapped():
             self.error_banner.pack(
                 fill="x", padx=0, pady=(0, 6), before=self.input_frame
@@ -190,46 +235,36 @@ class ChatPanel(ctk.CTkFrame):
         if text:
             self.entry_msg.insert(0, text)
 
-    def set_header(self, _text: str, _status: str = ""):
-        # Giữ phần khung chat sạch giống ảnh mẫu
-        return
-
     def _on_return(self, _event):
         self._send_text()
         return "break"
 
     def _send_text(self):
-        text = self.entry_msg.get().strip()
+        raw_text = self.entry_msg.get()
+        if len(raw_text) > MAX_MSG_CHARS:
+            self.show_error(
+                f"Tin nhắn vượt quá giới hạn {MAX_MSG_CHARS} ký tự ({len(raw_text)}/{MAX_MSG_CHARS})."
+            )
+            return
+        text = raw_text.strip()
         if not text:
             return
         if not (self.controller and self.controller.has_active_peer()):
             self.show_error("Hãy chọn một người để chat.")
             return
-        if len(text) > MAX_MSG_CHARS:
-            self.show_error(f"Tin nhắn vượt quá {MAX_MSG_CHARS} ký tự.")
-            return
 
         self.hide_error()
-        self.sticker_popup.hide_popup()
         self.entry_msg.delete(0, "end")
         self.entry_msg.focus_set()
         self.controller.send_text_message(text)
 
-    def _toggle_sticker_popup(self):
+    def _on_sticker_button_click(self):
         if not (self.controller and self.controller.has_active_peer()):
-            self.show_error("Hãy chọn một người để gửi sticker.")
-            return
-        self.update_idletasks()
-        popup_h = 212
-        x = max(4, self.tools_box.winfo_x() + self.btn_sticker.winfo_x())
-        y = max(4, self.input_frame.winfo_y() - popup_h - 6)
-        self.sticker_popup.toggle(x=x, y=y)
-
-    def _on_sticker_chosen(self, pack: str, sticker_id: str):
-        if self.controller and self.controller.has_active_peer():
+            self.show_error("Hãy chọn một người trước khi gửi sticker.")
+        else:
             self.hide_error()
-            self.entry_msg.focus_set()
-            self.controller.send_sticker(pack, sticker_id)
+        if callable(self.on_toggle_sticker_cb):
+            self.on_toggle_sticker_cb(self.btn_sticker)
 
     def _select_file(self):
         if not (self.controller and self.controller.has_active_peer()):
@@ -239,7 +274,7 @@ class ChatPanel(ctk.CTkFrame):
         if file_path:
             self.hide_error()
             self.entry_msg.focus_set()
-            self.controller.send_file(file_path, media_type="FILE")
+            self.controller.send_file(file_path, media_type=TYPE_FILE)
 
     def _select_image(self):
         if not (self.controller and self.controller.has_active_peer()):
@@ -247,12 +282,12 @@ class ChatPanel(ctk.CTkFrame):
             return
         file_path = filedialog.askopenfilename(
             title="Chọn ảnh để gửi",
-            filetypes=[("Image files", "*.png *.jpg *.jpeg *.gif *.webp")],
+            filetypes=[("Tệp hình ảnh", "*.png *.jpg *.jpeg *.gif *.webp")],
         )
         if file_path:
             self.hide_error()
             self.entry_msg.focus_set()
-            self.controller.send_file(file_path, media_type="IMAGE")
+            self.controller.send_file(file_path, media_type=TYPE_IMAGE)
 
     def _resolve_sticker_file(self, pack: str, sticker_id: str) -> str | None:
         stickers_root = _get_stickers_dir()
@@ -268,6 +303,11 @@ class ChatPanel(ctk.CTkFrame):
         for c in candidates:
             if os.path.isfile(c):
                 return c
+        for root, _dirs, files in os.walk(stickers_root):
+            for fname in files:
+                base, ext = os.path.splitext(fname)
+                if base == sticker_id and ext.lower() in exts:
+                    return os.path.join(root, fname)
         return None
 
     def _resolve_media_file(self, msg: dict) -> str | None:
@@ -303,7 +343,7 @@ class ChatPanel(ctk.CTkFrame):
 
     def append_single_message(self, msg: dict):
         sender_name = msg.get("sender_name") or msg.get("sender") or "Unknown"
-        msg_type = (msg.get("type") or "MSG").upper()
+        msg_type = (msg.get("type") or TYPE_MSG).upper()
         is_me = bool(msg.get("is_me", False))
         msg_id = msg.get("msg_id")
 
@@ -330,14 +370,11 @@ class ChatPanel(ctk.CTkFrame):
             text_color="#6B7280",
         ).pack(anchor=anchor, padx=4, pady=(0, 1))
 
-        if msg_type == "MSG":
-            # Chỉ tin nhắn văn bản của mình mới nằm trong khung màu tím #6A49FA
+        if msg_type == TYPE_MSG:
             bubble_fg = "#6A49FA" if is_me else "#F3F0FF"
             text_fg = "#FFFFFF" if is_me else "#1F2937"
 
-            bubble = ctk.CTkFrame(
-                row_container, fg_color=bubble_fg, corner_radius=14
-            )
+            bubble = ctk.CTkFrame(row_container, fg_color=bubble_fg, corner_radius=14)
             bubble.pack(anchor=anchor, fill="none")
 
             ctk.CTkLabel(
@@ -349,21 +386,20 @@ class ChatPanel(ctk.CTkFrame):
                 justify="left",
             ).pack(anchor="w", padx=12, pady=7)
 
-        elif msg_type == "STICKER":
-            # Sticker hiển thị độc lập trên nền vùng chat, KHÔNG để trong khung màu tím
+        elif msg_type == TYPE_STICKER:
             pack = msg.get("pack", "cat")
             sid = msg.get("sticker_id", "")
             st_path = self._resolve_sticker_file(pack, sid)
             if st_path:
                 try:
                     with Image.open(st_path) as im:
-                        pil_img = im.copy()
+                        pil_img = im.convert("RGBA").copy()
                     w, h = pil_img.size
-                    scale = min(145 / max(w, 1), 145 / max(h, 1), 1.0)
+                    scale = min(130 / max(w, 1), 130 / max(h, 1), 1.0)
                     ctk_img = ctk.CTkImage(
                         light_image=pil_img,
                         dark_image=pil_img,
-                        size=(max(48, int(w * scale)), max(48, int(h * scale))),
+                        size=(max(56, int(w * scale)), max(56, int(h * scale))),
                     )
                     self._image_cache.append(ctk_img)
                     ctk.CTkLabel(
@@ -375,24 +411,27 @@ class ChatPanel(ctk.CTkFrame):
                 except Exception:
                     ctk.CTkLabel(
                         row_container,
-                        text=f"[Sticker: {pack}/{sid}]",
-                        font=("Segoe UI", 12),
+                        text=f"[Sticker: {sid or pack}]",
+                        font=("Segoe UI", 13, "bold"),
+                        text_color="#6A49FA",
+                        fg_color="transparent",
                     ).pack(anchor=anchor, pady=2)
             else:
                 ctk.CTkLabel(
                     row_container,
-                    text=f"[Sticker: {pack}/{sid}]",
-                    font=("Segoe UI", 12),
-                ).pack(anchor=anchor, pady=2)
+                    text=f"✨ {(sid or 'Sticker').upper()}",
+                    font=("Segoe UI", 14, "bold"),
+                    text_color="#453284",
+                    fg_color="transparent",
+                ).pack(anchor=anchor, padx=8, pady=4)
 
-        elif msg_type == "IMAGE":
-            # Ảnh hiển thị full ảnh trên nền vùng chat, KHÔNG để trong khung màu tím
+        elif msg_type == TYPE_IMAGE:
             fname = msg.get("filename", "image.png")
             media_path = self._resolve_media_file(msg)
             if media_path:
                 try:
                     with Image.open(media_path) as im:
-                        pil_img = im.copy()
+                        pil_img = im.convert("RGBA").copy()
                     w, h = pil_img.size
                     max_w, max_h = 420, 360
                     scale = min(max_w / max(w, 1), max_h / max(h, 1), 1.0)

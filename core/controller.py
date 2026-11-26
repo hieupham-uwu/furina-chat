@@ -3,121 +3,248 @@ import os
 import threading
 import time
 import uuid
-from core.state import state
+import config
+from core.state import state as default_state
+from ui.chat_panel import _get_downloads_dir
 
-# Sau khoảng thời gian này mà chưa gửi/xác nhận được do lỗi mạng thì mới hiện "Chưa gửi được"
-SEND_ACK_TIMEOUT = 5.0
-FILE_ACK_TIMEOUT = 15.0
+SEND_ACK_TIMEOUT = 8.0
+FILE_ACK_TIMEOUT = max(15.0, float(getattr(config, "FILE_ACK_TIMEOUT", 15.0)))
+IDLE_AWAY_SECONDS = float(getattr(config, "IDLE_AWAY_SECONDS", 60.0))
+MAX_MSG_CHARS = 4000
+TYPE_MSG = getattr(config, "TYPE_MSG", "MSG")
+TYPE_STICKER = getattr(config, "TYPE_STICKER", "STICKER")
+TYPE_IMAGE = getattr(config, "TYPE_IMAGE", "IMAGE")
+TYPE_FILE = getattr(config, "TYPE_FILE", "FILE")
+
+
+def _unpack_event(event) -> tuple[str, dict]:
+    if isinstance(event, dict):
+        etype = event.get("name") or event.get("type") or ""
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            payload = event.get("data") if isinstance(event.get("data"), dict) else {}
+        return str(etype), dict(payload)
+
+    etype = getattr(event, "name", None) or getattr(event, "type", None) or ""
+    payload = getattr(event, "payload", None)
+    if not isinstance(payload, dict):
+        payload = getattr(event, "data", None)
+    if not isinstance(payload, dict):
+        payload = {}
+    return str(etype), dict(payload)
 
 
 class Controller:
-    def __init__(self, main_window, standalone_demo: bool = True):
+    def __init__(self, main_window, app_state=None, event_bus=None):
         self.main_window = main_window
-        self.standalone_demo = standalone_demo
+        self.state = app_state or default_state
+        self.event_bus = event_bus
         self.udp_service = None
         self.tcp_service = None
         self.file_service = None
-        self._pending_by_peer = {}  # {peer_id: [msg_obj, ...]}
+        self._pending_by_peer = {}
+        self._shutdown_event = threading.Event()
+        self._auto_selected_latest = False
 
     def bind_services(self, udp_service, tcp_service, file_service):
         self.udp_service = udp_service
         self.tcp_service = tcp_service
         self.file_service = file_service
+        with self.state.lock:
+            st = self.state.my_status
+        if self.udp_service and hasattr(self.udp_service, "set_status"):
+            try:
+                self.udp_service.set_status(st)
+            except Exception:
+                pass
 
     def has_active_peer(self) -> bool:
-        with state.lock:
-            return state.active_peer_id is not None
+        with self.state.lock:
+            return self.state.active_peer_id is not None
+
+    def record_user_activity(self, auto_back_online: bool = True):
+        now = time.time()
+        changed_to_online = False
+        with self.state.lock:
+            self.state.last_user_action_ts = now
+            if auto_back_online and self.state.my_status == "away":
+                self.state.my_status = "online"
+                changed_to_online = True
+        if changed_to_online:
+            self._push_status_to_network("online")
+            self.main_window.sidebar.set_my_status("online")
+
+    def check_idle_away(self):
+        now = time.time()
+        changed_to_away = False
+        with self.state.lock:
+            last_ts = getattr(self.state, "last_user_action_ts", now)
+            elapsed = now - float(last_ts or now)
+            if elapsed >= IDLE_AWAY_SECONDS and self.state.my_status != "away":
+                self.state.my_status = "away"
+                changed_to_away = True
+        if changed_to_away:
+            self._push_status_to_network("away")
+            self.main_window.sidebar.set_my_status("away")
+
+    def set_activity_status(self, new_status: str):
+        st = "away" if (new_status or "").lower() == "away" else "online"
+        with self.state.lock:
+            self.state.my_status = st
+            if st == "online":
+                self.state.last_user_action_ts = time.time()
+        self._push_status_to_network(st)
+        self.main_window.sidebar.set_my_status(st)
+
+    def _push_status_to_network(self, status: str):
+        if self.udp_service and hasattr(self.udp_service, "set_status"):
+            try:
+                self.udp_service.set_status(status)
+            except Exception:
+                pass
+
+    def _touch_activity(self, peer_id: str, ts: float | None = None):
+        if peer_id:
+            self.state.last_activity[peer_id] = float(
+                ts if ts is not None else time.time()
+            )
+
+    def _maybe_auto_select_latest_peer(self):
+        if self._auto_selected_latest:
+            return
+        with self.state.lock:
+            if self.state.active_peer_id is not None:
+                self._auto_selected_latest = True
+                return
+            candidates = [
+                pid
+                for pid, ts in self.state.last_activity.items()
+                if ts > 0 and len(self.state.chat_history.get(pid, [])) > 0
+            ]
+            if not candidates:
+                return
+            latest_pid = max(
+                candidates, key=lambda k: self.state.last_activity.get(k, 0.0)
+            )
+        self._auto_selected_latest = True
+        self.select_peer(latest_pid)
 
     def select_peer(self, new_peer_id: str):
+        if not new_peer_id:
+            return
+        self.record_user_activity(auto_back_online=True)
+        self.main_window.hide_sticker_popup()
+
+        pid = str(new_peer_id)
         current_input = self.main_window.chat_panel.get_current_input()
-        self.main_window.chat_panel.sticker_popup.hide_popup()
 
-        with state.lock:
-            if state.active_peer_id:
-                state.drafts[state.active_peer_id] = current_input
+        with self.state.lock:
+            if self.state.active_peer_id:
+                self.state.drafts[self.state.active_peer_id] = current_input
 
-            state.active_peer_id = new_peer_id
-            state.unread_counts[new_peer_id] = 0
-            restored_draft = state.drafts.get(new_peer_id, "")
-            peer_info = state.peers.get(new_peer_id, {})
-            peer_name = peer_info.get("name", "Unknown")
-            peer_status = peer_info.get("status", "offline")
+            self.state.active_peer_id = pid
+            self.state.unread_counts[pid] = 0
+            restored_draft = self.state.drafts.get(pid, "")
+            peer_info = self.state.peers.get(pid, {})
+            peer_name = peer_info.get("name") or peer_info.get("peer_name") or "Unknown"
+            peer_status = peer_info.get("status", "online")
 
-            history = list(state.chat_history.get(new_peer_id, []))
+            history = list(self.state.chat_history.get(pid, []))
             for m in history:
                 if m.get("is_me") and m.get("delivery_status") in ("Đã gửi", "Đã nhận"):
                     m["delivery_status"] = "Đã xem"
 
         if self.tcp_service and hasattr(self.tcp_service, "open_chat"):
             try:
-                self.tcp_service.open_chat(new_peer_id)
-            except Exception:
-                pass
+                self.tcp_service.open_chat(pid)
+            except Exception as err:
+                self.main_window.chat_panel.show_error(f"Cảnh báo: {err}")
 
         self.main_window.chat_panel.set_header(
-            f"Chat với: {peer_name}", status=peer_status
+            f"Đang chat với: {peer_name}", status=peer_status
         )
         self.main_window.chat_panel.set_current_input(restored_draft)
         self.main_window.chat_panel.render_messages(history)
         self.main_window.refresh_sidebar()
 
-    def change_status(self, new_status: str):
-        with state.lock:
-            state.my_status = new_status
-        if self.udp_service and hasattr(self.udp_service, "set_status"):
-            try:
-                self.udp_service.set_status(new_status)
-            except Exception:
-                pass
+    def change_my_name(self, new_name: str):
+        clean_name = (new_name or "").strip()
+        if not clean_name:
+            return
+        self.record_user_activity(auto_back_online=True)
+        with self.state.lock:
+            self.state.my_name = clean_name
+
+        for svc in (self.udp_service, self.tcp_service):
+            if svc is None:
+                continue
+            for attr in ("peer_name", "my_name", "name"):
+                if hasattr(svc, attr):
+                    try:
+                        setattr(svc, attr, clean_name)
+                    except Exception:
+                        pass
+            for fn_name in ("set_name", "update_name", "set_peer_name"):
+                fn = getattr(svc, fn_name, None)
+                if callable(fn):
+                    try:
+                        fn(clean_name)
+                    except Exception:
+                        pass
+
+        self.main_window.title(f"Furina Chat — {clean_name}")
+        self.main_window.sidebar.set_my_name(clean_name)
+
+    def _mark_unsent(self, peer_id: str, msg_obj: dict):
+        if msg_obj.get("acked") or msg_obj.get("delivery_status") in (
+            "Đã gửi",
+            "Đã nhận",
+            "Đã xem",
+        ):
+            return
+        msg_obj["delivery_status"] = "Chưa gửi được"
+        self.main_window.safe_update_status(peer_id, msg_obj["msg_id"], "Chưa gửi được")
 
     def _schedule_unsent_timeout(self, peer_id: str, msg_obj: dict, timeout: float):
-        """Chỉ chuyển sang 'Chưa gửi được' khi quá thời gian quy định mà vẫn chưa gửi/xác nhận được."""
         def _timer():
-            time.sleep(timeout)
-            if msg_obj.get("acked") or msg_obj.get("delivery_status") in (
-                "Đã gửi",
-                "Đã nhận",
-                "Đã xem",
-            ):
+            if self._shutdown_event.wait(timeout):
                 return
-            msg_obj["delivery_status"] = "Chưa gửi được"
-            self.main_window.safe_update_status(
-                peer_id, msg_obj["msg_id"], "Chưa gửi được"
-            )
+            self._mark_unsent(peer_id, msg_obj)
 
         threading.Thread(target=_timer, daemon=True).start()
 
-    def _simulate_local_send(self, peer_id: str, msg_obj: dict, is_file: bool = False):
-        def _worker():
-            if is_file:
-                for step in (0.25, 0.5, 0.75, 1.0):
-                    time.sleep(0.2)
-                    self.main_window.safe_progress(
-                        peer_id,
-                        step,
-                        f"Đang gửi {msg_obj.get('filename', 'file')}: {int(step * 100)}%",
-                    )
-            else:
-                time.sleep(0.25)
-
-            msg_obj["acked"] = True
-            msg_obj["delivery_status"] = "Đã gửi"
-            self.main_window.safe_update_status(peer_id, msg_obj["msg_id"], "Đã gửi")
-
-            time.sleep(0.6)
-            msg_obj["delivery_status"] = "Đã nhận"
-            self.main_window.safe_update_status(peer_id, msg_obj["msg_id"], "Đã nhận")
-
-        threading.Thread(target=_worker, daemon=True).start()
+    def _dispatch_send(
+        self, peer_id: str, msg_obj: dict, fn_names: tuple, args: tuple, timeout: float
+    ):
+        self._schedule_unsent_timeout(peer_id, msg_obj, timeout)
+        for svc in (self.tcp_service, self.file_service):
+            if svc is None:
+                continue
+            for fn_name in fn_names:
+                fn = getattr(svc, fn_name, None)
+                if callable(fn):
+                    try:
+                        res = fn(*args)
+                        if res is False:
+                            self._mark_unsent(peer_id, msg_obj)
+                        return res
+                    except Exception:
+                        self._mark_unsent(peer_id, msg_obj)
+                        return None
+        return None
 
     def send_text_message(self, text: str):
-        if len(text) > 4000:
-            text = text[:4000]
+        self.record_user_activity(auto_back_online=True)
+        if len(text) > MAX_MSG_CHARS:
+            self.main_window.chat_panel.show_error(
+                f"Cảnh báo: Tin nhắn vượt quá giới hạn {MAX_MSG_CHARS} ký tự."
+            )
+            return
 
-        with state.lock:
-            active_id = state.active_peer_id
-            my_id = state.my_peer_id
-            my_name = state.my_name
+        with self.state.lock:
+            active_id = self.state.active_peer_id
+            my_id = self.state.my_peer_id
+            my_name = self.state.my_name
 
         if not active_id:
             return
@@ -129,34 +256,35 @@ class Controller:
             "sender_id": my_id,
             "sender_name": my_name,
             "text": text,
-            "type": "MSG",
+            "type": TYPE_MSG,
             "timestamp": now_str,
             "is_me": True,
             "acked": False,
             "delivery_status": "Đang gửi...",
         }
 
-        with state.lock:
-            state.chat_history.setdefault(active_id, []).append(msg_obj)
-            state.drafts[active_id] = ""
+        with self.state.lock:
+            self.state.chat_history.setdefault(active_id, []).append(msg_obj)
+            self.state.drafts[active_id] = ""
+            self._touch_activity(active_id)
         self._pending_by_peer.setdefault(active_id, []).append(msg_obj)
 
         self.main_window.chat_panel.append_single_message(msg_obj)
-        self._schedule_unsent_timeout(active_id, msg_obj, SEND_ACK_TIMEOUT)
-
-        if self.tcp_service and hasattr(self.tcp_service, "send_message"):
-            try:
-                self.tcp_service.send_message(active_id, text)
-            except Exception:
-                self._schedule_unsent_timeout(active_id, msg_obj, SEND_ACK_TIMEOUT)
-        elif self.standalone_demo:
-            self._simulate_local_send(active_id, msg_obj, is_file=False)
+        self.main_window.refresh_sidebar()
+        self._dispatch_send(
+            active_id,
+            msg_obj,
+            ("send_message", "send_text"),
+            (active_id, text),
+            SEND_ACK_TIMEOUT,
+        )
 
     def send_sticker(self, pack: str, sticker_id: str):
-        with state.lock:
-            active_id = state.active_peer_id
-            my_id = state.my_peer_id
-            my_name = state.my_name
+        self.record_user_activity(auto_back_online=True)
+        with self.state.lock:
+            active_id = self.state.active_peer_id
+            my_id = self.state.my_peer_id
+            my_name = self.state.my_name
 
         if not active_id:
             return
@@ -169,42 +297,45 @@ class Controller:
             "sender_name": my_name,
             "pack": pack,
             "sticker_id": sticker_id,
-            "type": "STICKER",
+            "type": TYPE_STICKER,
             "timestamp": now_str,
             "is_me": True,
             "acked": False,
             "delivery_status": "Đang gửi...",
         }
 
-        with state.lock:
-            state.chat_history.setdefault(active_id, []).append(msg_obj)
+        with self.state.lock:
+            self.state.chat_history.setdefault(active_id, []).append(msg_obj)
+            self._touch_activity(active_id)
         self._pending_by_peer.setdefault(active_id, []).append(msg_obj)
 
         self.main_window.chat_panel.append_single_message(msg_obj)
-        self._schedule_unsent_timeout(active_id, msg_obj, SEND_ACK_TIMEOUT)
+        self.main_window.refresh_sidebar()
+        self._dispatch_send(
+            active_id,
+            msg_obj,
+            ("send_sticker",),
+            (active_id, pack, sticker_id),
+            SEND_ACK_TIMEOUT,
+        )
 
-        if self.tcp_service and hasattr(self.tcp_service, "send_sticker"):
-            try:
-                self.tcp_service.send_sticker(active_id, pack, sticker_id)
-            except Exception:
-                self._schedule_unsent_timeout(active_id, msg_obj, SEND_ACK_TIMEOUT)
-        elif self.standalone_demo:
-            self._simulate_local_send(active_id, msg_obj, is_file=False)
-
-    def send_file(self, file_path: str, media_type: str = "FILE"):
+    def send_file(self, file_path: str, media_type: str = TYPE_FILE):
+        self.record_user_activity(auto_back_online=True)
         if not file_path or not os.path.isfile(file_path):
-            self.main_window.chat_panel.show_error("File not found: tệp không tồn tại.")
+            self.main_window.chat_panel.show_error(
+                "Cảnh báo: Không tìm thấy tệp hoặc tệp không tồn tại."
+            )
             return
 
-        with state.lock:
-            active_id = state.active_peer_id
-            my_id = state.my_peer_id
-            my_name = state.my_name
+        with self.state.lock:
+            active_id = self.state.active_peer_id
+            my_id = self.state.my_peer_id
+            my_name = self.state.my_name
 
         if not active_id:
             return
 
-        norm_type = "IMAGE" if str(media_type).upper() == "IMAGE" else "FILE"
+        norm_type = TYPE_IMAGE if str(media_type).upper() == TYPE_IMAGE else TYPE_FILE
         msg_id = str(uuid.uuid4())
         fname = os.path.basename(file_path)
         fsize = os.path.getsize(file_path)
@@ -225,19 +356,21 @@ class Controller:
             "delivery_status": "Đang gửi...",
         }
 
-        with state.lock:
-            state.chat_history.setdefault(active_id, []).append(msg_obj)
+        with self.state.lock:
+            self.state.chat_history.setdefault(active_id, []).append(msg_obj)
+            self._touch_activity(active_id)
         self._pending_by_peer.setdefault(active_id, []).append(msg_obj)
 
         self.main_window.chat_panel.append_single_message(msg_obj)
+        self.main_window.refresh_sidebar()
         self._schedule_unsent_timeout(active_id, msg_obj, FILE_ACK_TIMEOUT)
 
         if self.file_service and hasattr(self.file_service, "send_file"):
             try:
                 tid = self.file_service.send_file(active_id, file_path, norm_type)
                 if tid:
-                    with state.lock:
-                        state.transfers[tid] = {
+                    with self.state.lock:
+                        self.state.transfers[tid] = {
                             "transfer_id": tid,
                             "peer_id": active_id,
                             "direction": "send",
@@ -247,54 +380,100 @@ class Controller:
                             "msg_obj": msg_obj,
                         }
             except Exception:
-                self._schedule_unsent_timeout(active_id, msg_obj, FILE_ACK_TIMEOUT)
-        elif self.standalone_demo:
-            self._simulate_local_send(active_id, msg_obj, is_file=True)
+                self._mark_unsent(active_id, msg_obj)
 
-    def leave_chat(self):
-        with state.lock:
-            active_id = state.active_peer_id
-            if not active_id:
+    def _cleanup_failed_transfer_files(self, fname: str, local_path: str = ""):
+        dl_dir = _get_downloads_dir()
+        candidates = set()
+        if local_path:
+            candidates.add(local_path)
+            candidates.add(local_path + ".part")
+        if fname and os.path.isdir(dl_dir):
+            base_target = os.path.join(dl_dir, os.path.basename(fname))
+            candidates.add(base_target + ".part")
+            for entry in os.listdir(dl_dir):
+                if entry.endswith(".part") and (
+                    not fname or os.path.basename(fname) in entry
+                ):
+                    candidates.add(os.path.join(dl_dir, entry))
+
+        for path in candidates:
+            if path and os.path.isfile(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+
+    def process_event(self, event):
+        etype, data = _unpack_event(event)
+        if not etype:
+            return
+
+        if etype in (
+            "peer_updated",
+            getattr(config, "EVENT_PEER_UPDATED", "peer_updated"),
+        ):
+            raw_pid = data.get("peer_id")
+            if not raw_pid:
                 return
-            state.drafts[active_id] = self.main_window.chat_panel.get_current_input()
-            state.active_peer_id = None
-
-        if self.tcp_service and hasattr(self.tcp_service, "leave_chat"):
-            try:
-                self.tcp_service.leave_chat(active_id)
-            except Exception:
-                pass
-
-        self.main_window.chat_panel.set_current_input("")
-        self.main_window.chat_panel.render_messages([])
-        self.main_window.refresh_sidebar()
-
-    def process_event(self, event: dict):
-        etype = event.get("type")
-        data = event.get("data") if isinstance(event.get("data"), dict) else event
-
-        if etype == "peer_updated":
-            pid = data.get("peer_id")
-            if not pid:
-                return
-            with state.lock:
-                existing = dict(state.peers.get(pid, {}))
+            pid = str(raw_pid)
+            with self.state.lock:
+                existing = dict(self.state.peers.get(pid, {}))
                 existing.update({k: v for k, v in data.items() if v is not None})
-                existing.setdefault("status", "online")
-                state.peers[pid] = existing
+                existing["peer_id"] = pid
+                if not existing.get("name") and existing.get("peer_name"):
+                    existing["name"] = existing["peer_name"]
+                raw_st = (existing.get("status") or "online").lower()
+                existing["status"] = "away" if raw_st == "away" else "online"
+                self.state.peers[pid] = existing
+                self.state.chat_history.setdefault(pid, [])
+                is_active = pid == self.state.active_peer_id
+                peer_name = existing.get("name") or existing.get("peer_name") or "Unknown"
+                peer_status = existing.get("status", "online")
+
+            if is_active:
+                self.main_window.chat_panel.set_header(
+                    f"Đang chat với: {peer_name}", status=peer_status
+                )
+            self._maybe_auto_select_latest_peer()
             self.main_window.refresh_sidebar()
 
-        elif etype == "peer_offline":
-            pid = data.get("peer_id")
-            if not pid:
+        elif etype in (
+            "peer_offline",
+            getattr(config, "EVENT_PEER_OFFLINE", "peer_offline"),
+        ):
+            raw_pid = data.get("peer_id")
+            if not raw_pid:
                 return
-            with state.lock:
-                if pid in state.peers:
-                    state.peers[pid]["status"] = "offline"
+            pid = str(raw_pid)
+            with self.state.lock:
+                existing = dict(self.state.peers.get(pid, {}))
+                existing["peer_id"] = pid
+                if not existing.get("name"):
+                    existing["name"] = data.get("name") or "Peer"
+                existing["status"] = "offline"
+                self.state.peers[pid] = existing
+                self.state.chat_history.setdefault(pid, [])
+                is_active = pid == self.state.active_peer_id
+                peer_name = existing.get("name") or "Unknown"
+
+            if is_active:
+                self.main_window.chat_panel.set_header(
+                    f"Đang chat với: {peer_name}", status="offline"
+                )
             self.main_window.refresh_sidebar()
 
         elif etype in ("message_sent", "sticker_sent"):
-            pid = data.get("peer_id")
+            raw_pid = data.get("peer_id")
+            pid = str(raw_pid) if raw_pid else None
+            if data.get("error") or data.get("failed"):
+                pending = self._pending_by_peer.get(pid, [])
+                for m in reversed(pending):
+                    if not m.get("acked"):
+                        self._mark_unsent(pid, m)
+                        break
+                return
+
             pending = self._pending_by_peer.get(pid, [])
             for m in reversed(pending):
                 if not m.get("acked"):
@@ -304,10 +483,10 @@ class Controller:
                     break
 
         elif etype in ("message_received", "sticker_received"):
-            # Dù peer đang hiển thị là offline trên discovery, vẫn nhận và hiển thị/lưu tin nhắn bình thường
-            pid = data.get("peer_id")
-            if not pid:
+            raw_pid = data.get("peer_id")
+            if not raw_pid:
                 return
+            pid = str(raw_pid)
             raw_msg = (
                 dict(data["message"])
                 if isinstance(data.get("message"), dict)
@@ -317,46 +496,66 @@ class Controller:
                 "msg_id": raw_msg.get("msg_id") or str(uuid.uuid4()),
                 "sender_name": raw_msg.get("sender_name")
                 or raw_msg.get("sender")
-                or state.peers.get(pid, {}).get("name", "Peer"),
+                or self.state.peers.get(pid, {}).get("name", "Peer"),
                 "text": raw_msg.get("text", ""),
                 "pack": raw_msg.get("pack", "cat"),
                 "sticker_id": raw_msg.get("sticker_id", ""),
                 "type": raw_msg.get("type")
-                or ("STICKER" if etype == "sticker_received" else "MSG"),
+                or (TYPE_STICKER if etype == "sticker_received" else TYPE_MSG),
                 "timestamp": raw_msg.get("timestamp")
                 or datetime.now().strftime("%H:%M"),
                 "is_me": False,
                 "delivery_status": "Đã nhận",
             }
 
-            with state.lock:
-                state.chat_history.setdefault(pid, []).append(msg)
-                is_active = pid == state.active_peer_id
+            with self.state.lock:
+                self.state.peers.setdefault(
+                    pid,
+                    {
+                        "peer_id": pid,
+                        "name": msg["sender_name"],
+                        "status": getattr(config, "STATUS_ONLINE", "online"),
+                    },
+                )
+                self.state.chat_history.setdefault(pid, []).append(msg)
+                self._touch_activity(pid)
+                is_active = pid == self.state.active_peer_id
                 if not is_active:
-                    state.unread_counts[pid] = state.unread_counts.get(pid, 0) + 1
+                    self.state.unread_counts[pid] = (
+                        self.state.unread_counts.get(pid, 0) + 1
+                    )
 
-            if is_active:
+            self._maybe_auto_select_latest_peer()
+            with self.state.lock:
+                is_active_now = pid == self.state.active_peer_id
+
+            if is_active_now:
                 self.main_window.chat_panel.append_single_message(msg)
-            else:
-                self.main_window.refresh_sidebar()
+            self.main_window.refresh_sidebar()
 
-        elif etype == "transfer_started":
+        elif etype in (
+            "transfer_started",
+            getattr(config, "EVENT_TRANSFER_STARTED", "transfer_started"),
+        ):
             tid = data.get("transfer_id")
-            pid = data.get("peer_id")
+            raw_pid = data.get("peer_id")
+            pid = str(raw_pid) if raw_pid else None
             direction = data.get("direction", "receive")
             fname = data.get("filename", "file")
             total_bytes = int(data.get("total_bytes") or 0)
             mtype = (
                 data.get("media_type")
                 or (
-                    "IMAGE"
-                    if fname.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))
-                    else "FILE"
+                    TYPE_IMAGE
+                    if fname.lower().endswith(
+                        (".png", ".jpg", ".jpeg", ".gif", ".webp")
+                    )
+                    else TYPE_FILE
                 )
             ).upper()
 
-            with state.lock:
-                tr = state.transfers.setdefault(tid, {"transfer_id": tid})
+            with self.state.lock:
+                tr = self.state.transfers.setdefault(tid, {"transfer_id": tid})
                 tr.update(
                     {
                         "peer_id": pid,
@@ -366,11 +565,13 @@ class Controller:
                         "bytes_done": 0,
                     }
                 )
-                is_active = pid == state.active_peer_id
+                if pid:
+                    self._touch_activity(pid)
+                is_active = pid == self.state.active_peer_id
                 if direction == "receive" and pid:
                     rec = {
                         "msg_id": str(uuid.uuid4()),
-                        "sender_name": state.peers.get(pid, {}).get("name", "Peer"),
+                        "sender_name": self.state.peers.get(pid, {}).get("name", "Peer"),
                         "type": mtype,
                         "filename": fname,
                         "size": total_bytes,
@@ -379,20 +580,29 @@ class Controller:
                         "delivery_status": "Đang nhận...",
                     }
                     tr["msg_obj"] = rec
-                    state.chat_history.setdefault(pid, []).append(rec)
+                    self.state.chat_history.setdefault(pid, []).append(rec)
                     if not is_active:
-                        state.unread_counts[pid] = state.unread_counts.get(pid, 0) + 1
+                        self.state.unread_counts[pid] = (
+                            self.state.unread_counts.get(pid, 0) + 1
+                        )
 
-            if is_active and direction == "receive" and tr.get("msg_obj"):
+            self._maybe_auto_select_latest_peer()
+            with self.state.lock:
+                is_active_now = pid == self.state.active_peer_id
+
+            if is_active_now and direction == "receive" and tr.get("msg_obj"):
                 self.main_window.chat_panel.append_single_message(tr["msg_obj"])
-            elif not is_active:
-                self.main_window.refresh_sidebar()
+            self.main_window.refresh_sidebar()
 
-        elif etype == "transfer_progress":
+        elif etype in (
+            "transfer_progress",
+            getattr(config, "EVENT_TRANSFER_PROGRESS", "transfer_progress"),
+        ):
             tid = data.get("transfer_id")
-            with state.lock:
-                tr = state.transfers.get(tid, {})
-                pid = data.get("peer_id") or tr.get("peer_id")
+            with self.state.lock:
+                tr = self.state.transfers.get(tid, {})
+                raw_pid = data.get("peer_id") or tr.get("peer_id")
+                pid = str(raw_pid) if raw_pid else None
                 fname = data.get("filename") or tr.get("filename") or "file"
                 total = int(data.get("total_bytes") or tr.get("total_bytes") or 0)
                 done = int(data.get("bytes_done") or tr.get("bytes_done") or 0)
@@ -402,7 +612,7 @@ class Controller:
                     pct = done / total
                 else:
                     pct = 1.0
-                is_active = pid == state.active_peer_id
+                is_active = pid == self.state.active_peer_id
 
             if is_active:
                 text = (
@@ -411,14 +621,18 @@ class Controller:
                 )
                 self.main_window.chat_panel.update_progress(pct, text)
 
-        elif etype == "transfer_finished":
+        elif etype in (
+            "transfer_finished",
+            getattr(config, "EVENT_TRANSFER_FINISHED", "transfer_finished"),
+        ):
             tid = data.get("transfer_id")
             fname = data.get("filename") or "file"
             local_path = data.get("local_path") or ""
 
-            with state.lock:
-                tr = state.transfers.get(tid, {})
-                pid = data.get("peer_id") or tr.get("peer_id")
+            with self.state.lock:
+                tr = self.state.transfers.get(tid, {})
+                raw_pid = data.get("peer_id") or tr.get("peer_id")
+                pid = str(raw_pid) if raw_pid else None
                 direction = data.get("direction") or tr.get("direction") or "send"
                 msg_obj = tr.get("msg_obj")
                 if msg_obj:
@@ -426,24 +640,35 @@ class Controller:
                         msg_obj["local_path"] = local_path
                         msg_obj["filepath"] = local_path
                     msg_obj["acked"] = True
-                    msg_obj["delivery_status"] = "Đã gửi" if direction == "send" else "Đã nhận"
-                is_active = pid == state.active_peer_id
-                history = list(state.chat_history.get(pid, [])) if is_active else []
+                    msg_obj["delivery_status"] = (
+                        "Đã gửi" if direction == "send" else "Đã nhận"
+                    )
+                is_active = pid == self.state.active_peer_id
+                history = list(self.state.chat_history.get(pid, [])) if is_active else []
 
             if is_active:
                 self.main_window.chat_panel.render_messages(history)
                 self.main_window.chat_panel.update_progress(1.0, f"Hoàn tất {fname}")
 
-        elif etype == "transfer_failed":
+        elif etype in (
+            "transfer_failed",
+            getattr(config, "EVENT_TRANSFER_FAILED", "transfer_failed"),
+        ):
             tid = data.get("transfer_id")
             reason = data.get("reason") or "Truyền tệp thất bại"
-            with state.lock:
-                tr = state.transfers.get(tid, {})
-                pid = data.get("peer_id") or tr.get("peer_id")
+            local_path = data.get("local_path") or ""
+
+            with self.state.lock:
+                tr = self.state.transfers.get(tid, {})
+                raw_pid = data.get("peer_id") or tr.get("peer_id")
+                pid = str(raw_pid) if raw_pid else None
+                fname = data.get("filename") or tr.get("filename") or ""
                 msg_obj = tr.get("msg_obj")
                 if msg_obj:
                     msg_obj["delivery_status"] = "Chưa gửi được"
-                is_active = pid == state.active_peer_id
+                is_active = pid == self.state.active_peer_id
+
+            self._cleanup_failed_transfer_files(fname, local_path=local_path)
 
             if msg_obj and msg_obj.get("msg_id") and is_active:
                 self.main_window.chat_panel.update_message_status(
@@ -451,16 +676,35 @@ class Controller:
                 )
             if is_active:
                 self.main_window.chat_panel.update_progress(1.0, "Lỗi truyền tệp")
-                self.main_window.chat_panel.show_error(reason)
+                self.main_window.chat_panel.show_error(f"Cảnh báo: {reason}")
+
+        elif etype in ("send_failed", "message_failed"):
+            raw_pid = data.get("peer_id")
+            pid = str(raw_pid) if raw_pid else None
+            pending = self._pending_by_peer.get(pid, [])
+            for m in reversed(pending):
+                if not m.get("acked"):
+                    self._mark_unsent(pid, m)
+                    break
 
         elif etype == "operation_failed":
             reason = data.get("reason") or "Thao tác thất bại"
-            self.main_window.chat_panel.show_error(reason)
+            self.main_window.chat_panel.show_error(f"Cảnh báo: {reason}")
 
     def shutdown(self):
-        for svc in (self.tcp_service, self.file_service, self.udp_service):
-            if svc and hasattr(svc, "stop"):
-                try:
-                    svc.stop()
-                except Exception:
-                    pass
+        self._shutdown_event.set()
+        if self.file_service and hasattr(self.file_service, "stop"):
+            try:
+                self.file_service.stop()
+            except Exception:
+                pass
+        if self.tcp_service and hasattr(self.tcp_service, "stop"):
+            try:
+                self.tcp_service.stop()
+            except Exception:
+                pass
+        if self.udp_service and hasattr(self.udp_service, "stop"):
+            try:
+                self.udp_service.stop()
+            except Exception:
+                pass
