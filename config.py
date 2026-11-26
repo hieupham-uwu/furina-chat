@@ -109,7 +109,8 @@ FILE_CHUNK_SIZE: int = 65_536  # 64 KiB
 # ==============================================================================
 # 6. Truyền file (media)
 # ==============================================================================
-# Purpose của gói HI cho kết nối truyền file
+# Purpose của gói HI: "chat" mở kết nối chat, "media" mở kết nối truyền file
+HI_PURPOSE_CHAT = "chat"
 HI_PURPOSE_MEDIA = "media"
 
 # Hướng truyền dùng trong payload sự kiện

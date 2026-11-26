@@ -17,6 +17,7 @@ from threading import Lock, Thread
 from uuid import UUID
 
 import config
+from network import file_service
 from network.protocol import recv_header, send_packet
 
 
@@ -26,12 +27,13 @@ def send_chat_hi(sock, peer_id, name, tcp_port):
         "peer_id": peer_id,
         "name": name,
         "tcp_port": tcp_port,
-        "purpose": "chat",
+        "purpose": config.HI_PURPOSE_CHAT,
         "payload_size": 0,
     })
 
 
-def recv_chat_hi(sock):
+def recv_hi(sock):
+    """Đọc trọn một frame HI (chat hoặc media) trong thời hạn cho phép."""
     previous_timeout = sock.gettimeout()
 
     # Mọi lần đọc của cùng một frame HI dùng chung một hạn chót.
@@ -41,8 +43,14 @@ def recv_chat_hi(sock):
     finally:
         sock.settimeout(previous_timeout)
 
-    if header["type"] != config.TYPE_HI or header.get("purpose") != "chat":
-        raise ValueError("Expected a chat HI frame")
+    if header["type"] != config.TYPE_HI:
+        raise ValueError("Expected a HI frame")
+
+    if header.get("purpose") not in (
+        config.HI_PURPOSE_CHAT,
+        config.HI_PURPOSE_MEDIA,
+    ):
+        raise ValueError("Invalid HI purpose")
 
     peer_id = header.get("peer_id")
     if not isinstance(peer_id, str):
@@ -57,6 +65,13 @@ def recv_chat_hi(sock):
     if type(port) is not int or not 1 <= port <= 65535:
         raise ValueError("Invalid TCP port")
 
+    return header
+
+
+def recv_chat_hi(sock):
+    header = recv_hi(sock)
+    if header["purpose"] != config.HI_PURPOSE_CHAT:
+        raise ValueError("Expected a chat HI frame")
     return header
 
 
@@ -384,10 +399,15 @@ class TCPService:
     def _accept_chat(self, sock, local_peer):
         peer_id = None
         try:
-            greeting = recv_chat_hi(sock)
+            greeting = recv_hi(sock)
             peer_id = greeting["peer_id"]
             if peer_id == self.peer_id:
                 raise ValueError("Cannot open chat with yourself")
+
+            if greeting["purpose"] == config.HI_PURPOSE_MEDIA:
+                # Kết nối media đi một chiều: không trả HI, không đăng ký chat.
+                self._handoff_media(sock, peer_id)
+                return
 
             local_id, local_name, local_port = local_peer
             sock.settimeout(config.HI_FRAME_TIMEOUT)
@@ -406,6 +426,15 @@ class TCPService:
             return
 
         self._read_chat(peer_id, chat)
+
+    def _handoff_media(self, sock, peer_id):
+        """Giao socket cho file_service; nó đọc FILE/IMAGE và tự đóng socket."""
+        try:
+            file_service.handle_incoming(sock, peer_id)
+        finally:
+            with self._lock:
+                # file_service đã đóng socket, TCP chỉ cần quên nó đi.
+                self._sockets.discard(sock)
 
     def _register_chat(self, peer_id, sock, outgoing):
         chat = _ChatConnection(sock, outgoing)
