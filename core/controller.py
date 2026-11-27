@@ -336,20 +336,23 @@ class Controller:
         etype = event.get("type")
         data = event.get("data") if isinstance(event.get("data"), dict) else event
 
-        if etype == "peer_updated":
+        if etype == "peer_updated" or (etype == "chat_connected" and "name" in data):
             pid = data.get("peer_id")
             if not pid:
                 return
             with state.lock:
-                existing = dict(state.peers.get(pid, {}))
-                existing.update({k: v for k, v in data.items() if v is not None})
-                existing.setdefault("status", "online")
-                state.peers[pid] = existing
+                existing = state.peers.get(pid)
+                if etype == "chat_connected" and existing and existing.get("status") != "offline":
+                    return
+                peer = dict(existing or {})
+                peer.update({k: v for k, v in data.items() if v is not None})
+                peer["status"] = data.get("status") or config.STATUS_ONLINE
+                state.peers[pid] = peer
             self.main_window.refresh_sidebar()
 
         elif etype == "peer_offline":
             pid = data.get("peer_id")
-            if not pid:
+            if not pid or (self.tcp_service and self.tcp_service.has_chat(pid)):
                 return
             with state.lock:
                 if pid in state.peers:
@@ -361,9 +364,16 @@ class Controller:
             if not pid:
                 return
             reason = data.get("reason") or "connection_closed"
+            discovered = self.udp_service is not None and self.udp_service.get_peer(pid)
             with state.lock:
-                name = state.peers.get(pid, {}).get("name", "peer")
+                peer = state.peers.get(pid)
+                mark_offline = peer is not None and not discovered
+                if mark_offline:
+                    peer["status"] = "offline"
+                name = peer.get("name", "peer") if peer is not None else "peer"
                 is_active = pid == state.active_peer_id
+            if mark_offline:
+                self.main_window.refresh_sidebar()
             if is_active:
                 self.main_window.chat_panel.show_error(
                     f"Mất kết nối chat với {name} ({reason}). Gửi tin mới để kết nối lại."

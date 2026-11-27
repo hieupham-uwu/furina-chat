@@ -22,6 +22,7 @@ và cổng thực tế được quảng bá trong HELLO.
 """
 
 import argparse
+from ipaddress import IPv4Address
 import threading
 import time
 import uuid
@@ -159,7 +160,7 @@ def resolve_peer(state, target):
     return None
 
 
-def run_gui(name, port):
+def run_gui(name, port, discovery_ip=None):
     from tkinter import messagebox
 
     from core.state import AppState
@@ -174,14 +175,23 @@ def run_gui(name, port):
     udp = None
 
     def get_peer(peer_id):
-        return udp.get_peer(peer_id) if udp is not None else None
+        discovered_peer = udp.get_peer(peer_id) if udp is not None else None
+        if discovered_peer is not None:
+            return discovered_peer
+        with state.lock:
+            peer = state.peers.get(peer_id)
+            if peer is not None and peer.get("status") != "offline":
+                return peer.copy()
+        return None
 
     tcp = TCPService(state.my_peer_id, name, get_peer, bus, port=port)
     window.controller.bind_services(None, tcp, None)
     try:
         try:
             state.my_tcp_port = tcp.start()
-            udp = UDPService(state.my_peer_id, name, state.my_tcp_port, bus)
+            udp = UDPService(
+                state.my_peer_id, name, state.my_tcp_port, bus, discovery_ip=discovery_ip
+            )
             window.controller.bind_services(udp, tcp, file_service)
             file_service.configure(
                 state.my_peer_id, name, state.my_tcp_port, get_peer, bus
@@ -215,14 +225,20 @@ def main():
         default=config.DEFAULT_TCP_PORT,
         help="cổng TCP (0 = hệ điều hành tự cấp)",
     )
+    parser.add_argument(
+        "--discovery-ip",
+        type=IPv4Address,
+        help="gửi thêm gói tìm máy tới IPv4 này (địa chỉ peer hoặc broadcast của LAN)",
+    )
     args = parser.parse_args()
     args.name = args.name.strip()
     if not args.name:
         parser.error("--name không được để trống")
     if not 0 <= args.tcp_port <= 65535:
         parser.error("--tcp-port phải nằm trong khoảng 0 đến 65535")
+    discovery_ip = str(args.discovery_ip) if args.discovery_ip else None
     if args.gui:
-        return run_gui(args.name, args.tcp_port)
+        return run_gui(args.name, args.tcp_port, discovery_ip)
 
     # peer_id tạo một lần, dùng chung cho HELLO (UDP) và HI (TCP)
     peer_id = str(uuid.uuid4())
@@ -241,7 +257,7 @@ def main():
         print(f"Không mở được TCP: {error}")
         return 1
 
-    udp = UDPService(peer_id, args.name, tcp_port, bus)
+    udp = UDPService(peer_id, args.name, tcp_port, bus, discovery_ip=discovery_ip)
     try:
         udp.start()
     except OSError as error:

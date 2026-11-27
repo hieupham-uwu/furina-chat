@@ -70,7 +70,13 @@ class ChatTests(unittest.TestCase):
 
         self.duong.open_chat(self.hieu.peer_id)
         self.duong.open_chat(other_hieu.peer_id)
-        self.wait_for_event(self.hieu_bus, "chat_connected", self.duong.peer_id)
+        incoming = self.wait_for_event(self.hieu_bus, "chat_connected", self.duong.peer_id)
+        self.assertEqual(incoming.payload, {
+            "peer_id": self.duong.peer_id,
+            "name": self.duong.peer_name,
+            "ip": "127.0.0.1",
+            "tcp_port": self.duong.tcp_port,
+        })
         self.wait_for_event(other_bus, "chat_connected", self.duong.peer_id)
 
         self.wait_for_event(self.duong_bus, "chat_connected", self.hieu.peer_id)

@@ -63,6 +63,14 @@ python main.py --gui --name May2
 
 Nếu máy kia không xuất hiện, kiểm tra xem mạng Wi-Fi có cho phép các thiết bị liên lạc với nhau và tường lửa có cho phép Python trên mạng riêng hay không. UDP discovery dùng cổng `9999`. Có thể chạy với `--tcp-port 5000` nếu cần dùng một cổng TCP cố định.
 
+Khi máy có nhiều card mạng, thêm `--discovery-ip` cùng địa chỉ IPv4 Wi-Fi của máy kia để gửi gói tìm máy trực tiếp. Ví dụ, nếu máy kia có IP `192.168.1.20`:
+
+```powershell
+python main.py --gui --name May1 --discovery-ip 192.168.1.20
+```
+
+Khi máy kia chọn cuộc chat hoặc gửi tin, kết nối TCP đến sẽ thêm tên máy đó vào **Chats**.
+
 ## Kiểm thử
 
 - `python main.py --name May1` chạy bản console để kiểm tra UDP và TCP.

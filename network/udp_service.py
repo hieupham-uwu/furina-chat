@@ -27,6 +27,8 @@ class UDPService:
         peer_name: str,
         tcp_port: int,
         event_bus: Any = None,
+        *,
+        discovery_ip: Optional[str] = None,
     ) -> None:
         if not isinstance(peer_id, str) or not peer_id.strip():
             raise ValueError("peer_id must be a non-empty string")
@@ -44,6 +46,9 @@ class UDPService:
         self.tcp_port = tcp_port
         self.status = config.STATUS_ONLINE
         self._event_bus = event_bus
+        self._hello_targets = [config.UDP_BROADCAST_ADDR]
+        if discovery_ip and discovery_ip != config.UDP_BROADCAST_ADDR[0]:
+            self._hello_targets.append((discovery_ip, config.UDP_DISCOVERY_PORT))
 
         self._peers: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.Lock()
@@ -148,11 +153,12 @@ class UDPService:
             status = self.status
 
         data = protocol.pack_udp_hello(self.peer_id, self.peer_name, self.tcp_port, status)
-        try:
-            sock.sendto(data, config.UDP_BROADCAST_ADDR)
-        except OSError:
-            # Mạng chập chờn hoặc chưa kết nối: bỏ qua, luồng vẫn sống
-            pass
+        for target in self._hello_targets:
+            try:
+                sock.sendto(data, target)
+            except OSError:
+                # Một tuyến không gửi được vẫn thử các tuyến còn lại.
+                continue
 
     def _publish(self, event_name: str, payload: Dict[str, Any]) -> None:
         if self._event_bus is not None:

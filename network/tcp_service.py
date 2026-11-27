@@ -394,7 +394,7 @@ class TCPService:
         # Mỗi kết nối có luồng riêng, nên HI đến chậm không chặn accept().
         while True:
             try:
-                sock, _ = listener.accept()
+                sock, address = listener.accept()
             except socket.timeout:
                 continue
             except OSError:
@@ -408,10 +408,12 @@ class TCPService:
                 local_peer = (self.peer_id, self.peer_name, self.tcp_port)
 
             Thread(
-                target=self._accept_connection, args=(sock, local_peer), daemon=True
+                target=self._accept_connection,
+                args=(sock, address[0], local_peer),
+                daemon=True,
             ).start()
 
-    def _accept_connection(self, sock, local_peer):
+    def _accept_connection(self, sock, remote_ip, local_peer):
         peer_id = None
         purpose = config.HI_PURPOSE_CHAT
         try:
@@ -436,7 +438,10 @@ class TCPService:
             self._discard_socket(sock)
             return
 
-        chat = self._register_chat(peer_id, sock, outgoing=False)
+        chat = self._register_chat(
+            peer_id, sock, outgoing=False,
+            peer_info={"name": greeting["name"], "ip": remote_ip, "tcp_port": greeting["tcp_port"]},
+        )
         if chat is None:
             self._discard_socket(sock)
             return
@@ -469,7 +474,7 @@ class TCPService:
                 with self._lock:
                     self._sockets.discard(sock)
 
-    def _register_chat(self, peer_id, sock, outgoing):
+    def _register_chat(self, peer_id, sock, outgoing, *, peer_info=None):
         chat = _ChatConnection(sock, outgoing)
         with self._lock:
             if sock not in self._sockets:
@@ -484,7 +489,10 @@ class TCPService:
 
             self._chats[peer_id] = chat
             if old_chat is None:
-                self._bus.publish("chat_connected", {"peer_id": peer_id})
+                details = {"peer_id": peer_id}
+                if peer_info is not None:
+                    details.update(peer_info)
+                self._bus.publish("chat_connected", details)
 
         if old_chat is not None:
             self._discard_socket(old_chat.sock)
