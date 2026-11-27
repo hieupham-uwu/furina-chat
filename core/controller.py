@@ -9,6 +9,9 @@ from core.state import state
 SEND_ACK_TIMEOUT = 5.0
 FILE_ACK_TIMEOUT = 15.0
 
+# Chờ tối đa để kết nối chat sẵn sàng trước khi gửi (chạy ở thread nền).
+CHAT_READY_TIMEOUT = 4.0
+
 
 class Controller:
     def __init__(self, main_window, standalone_demo: bool = True):
@@ -48,11 +51,12 @@ class Controller:
                 if m.get("is_me") and m.get("delivery_status") in ("Đã gửi", "Đã nhận"):
                     m["delivery_status"] = "Đã xem"
 
+        # Mở chat ở thread nền: connect tới peer offline có thể chờ tới 5 giây,
+        # không được làm đứng giao diện.
         if self.tcp_service and hasattr(self.tcp_service, "open_chat"):
-            try:
-                self.tcp_service.open_chat(new_peer_id)
-            except Exception:
-                pass
+            threading.Thread(
+                target=self._open_chat_async, args=(new_peer_id,), daemon=True
+            ).start()
 
         self.main_window.chat_panel.set_header(
             f"Chat với: {peer_name}", status=peer_status
@@ -60,6 +64,70 @@ class Controller:
         self.main_window.chat_panel.set_current_input(restored_draft)
         self.main_window.chat_panel.render_messages(history)
         self.main_window.refresh_sidebar()
+
+    def _open_chat_async(self, peer_id: str):
+        try:
+            self.tcp_service.open_chat(peer_id)
+        except Exception:
+            pass
+
+    def _has_chat(self, peer_id: str) -> bool:
+        svc = self.tcp_service
+        if svc is None:
+            return False
+        checker = getattr(svc, "has_chat", None)
+        if callable(checker):
+            return bool(checker(peer_id))
+        getter = getattr(svc, "_get_chat", None)
+        return bool(getter and getter(peer_id))
+
+    def _send_now(self, kind: str, peer_id: str, *args):
+        svc = self.tcp_service
+        if svc is None:
+            return
+        try:
+            if kind == "message":
+                svc.send_message(peer_id, *args)
+            elif kind == "sticker":
+                svc.send_sticker(peer_id, *args)
+        except Exception:
+            pass
+
+    def _deliver(self, kind: str, peer_id: str, *args):
+        """Gửi ngay nếu chat đã mở; nếu chưa thì chờ/mở ở thread nền để UI không đứng."""
+        if self.tcp_service is None:
+            return
+
+        try:
+            ready = self._has_chat(peer_id)
+        except Exception:
+            ready = False
+
+        if ready:
+            self._send_now(kind, peer_id, *args)
+            return
+
+        def _wait_then_send():
+            deadline = time.monotonic() + CHAT_READY_TIMEOUT
+            attempted_open = False
+            while time.monotonic() < deadline:
+                try:
+                    if self._has_chat(peer_id):
+                        self._send_now(kind, peer_id, *args)
+                        return
+                except Exception:
+                    return
+                if not attempted_open:
+                    attempted_open = True
+                    try:
+                        self.tcp_service.open_chat(peer_id)
+                    except Exception:
+                        pass
+                else:
+                    time.sleep(0.05)
+            # Hết thời gian: bộ hẹn giờ sẽ hiển thị "Chưa gửi được".
+
+        threading.Thread(target=_wait_then_send, daemon=True).start()
 
     def change_status(self, new_status: str):
         with state.lock:
@@ -145,10 +213,7 @@ class Controller:
         self._schedule_unsent_timeout(active_id, msg_obj, SEND_ACK_TIMEOUT)
 
         if self.tcp_service and hasattr(self.tcp_service, "send_message"):
-            try:
-                self.tcp_service.send_message(active_id, text)
-            except Exception:
-                self._schedule_unsent_timeout(active_id, msg_obj, SEND_ACK_TIMEOUT)
+            self._deliver("message", active_id, text)
         elif self.standalone_demo:
             self._simulate_local_send(active_id, msg_obj, is_file=False)
 
@@ -184,10 +249,7 @@ class Controller:
         self._schedule_unsent_timeout(active_id, msg_obj, SEND_ACK_TIMEOUT)
 
         if self.tcp_service and hasattr(self.tcp_service, "send_sticker"):
-            try:
-                self.tcp_service.send_sticker(active_id, pack, sticker_id)
-            except Exception:
-                self._schedule_unsent_timeout(active_id, msg_obj, SEND_ACK_TIMEOUT)
+            self._deliver("sticker", active_id, pack, sticker_id)
         elif self.standalone_demo:
             self._simulate_local_send(active_id, msg_obj, is_file=False)
 
@@ -292,6 +354,28 @@ class Controller:
                 if pid in state.peers:
                     state.peers[pid]["status"] = "offline"
             self.main_window.refresh_sidebar()
+
+        elif etype == "chat_connected":
+            pid = data.get("peer_id")
+            if not pid:
+                return
+            with state.lock:
+                if pid in state.peers:
+                    state.peers[pid]["status"] = "online"
+            self.main_window.refresh_sidebar()
+
+        elif etype == "chat_disconnected":
+            pid = data.get("peer_id")
+            if not pid:
+                return
+            reason = data.get("reason") or "connection_closed"
+            with state.lock:
+                name = state.peers.get(pid, {}).get("name", "peer")
+                is_active = pid == state.active_peer_id
+            if is_active:
+                self.main_window.chat_panel.show_error(
+                    f"Mất kết nối chat với {name} ({reason}). Gửi tin mới để kết nối lại."
+                )
 
         elif etype in ("message_sent", "sticker_sent"):
             pid = data.get("peer_id")
@@ -458,7 +542,8 @@ class Controller:
             self.main_window.chat_panel.show_error(reason)
 
     def shutdown(self):
-        for svc in (self.tcp_service, self.file_service, self.udp_service):
+        # Dừng file trước TCP để các phiên truyền đang dở được đóng gọn.
+        for svc in (self.file_service, self.tcp_service, self.udp_service):
             if svc and hasattr(svc, "stop"):
                 try:
                     svc.stop()

@@ -319,6 +319,10 @@ class TCPService:
                 if self._opening.get(peer_id) is sock:
                     del self._opening[peer_id]
 
+    def has_chat(self, peer_id) -> bool:
+        """Cho Controller biết đã có kết nối chat sẵn sàng để gửi hay chưa."""
+        return self._get_chat(peer_id) is not None
+
     def send_message(self, peer_id, text):
         """Gửi một frame MSG qua kết nối đang dùng với peer."""
         self._send_on_chat(peer_id, "send_message", send_chat_message, text)

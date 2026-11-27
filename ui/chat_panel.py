@@ -190,8 +190,9 @@ class ChatPanel(ctk.CTkFrame):
         if text:
             self.entry_msg.insert(0, text)
 
-    def set_header(self, _text: str, _status: str = ""):
-        # Giữ phần khung chat sạch giống ảnh mẫu
+    def set_header(self, _text: str = "", status: str = "", _status: str = ""):
+        # Giữ phần khung chat sạch giống ảnh mẫu.
+        # Nhận cả "status" (controller) và "_status" (kiểu cũ) để không vỡ lời gọi.
         return
 
     def _on_return(self, _event):

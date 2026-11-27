@@ -1,4 +1,5 @@
 import os
+import queue
 import sys
 import threading
 import time
@@ -9,7 +10,7 @@ if _ROOT_DIR not in sys.path:
     sys.path.insert(0, _ROOT_DIR)
 
 from core.controller import Controller
-from core.state import state
+from core.state import state as app_state_singleton
 from ui.chat_panel import ChatPanel
 from ui.peer_sidebar import PeerSidebar
 
@@ -33,19 +34,22 @@ class MainWindow(ctk.CTk):
 
         self._poll_after_id = None
         self._closing = False
+        # Hàng đợi callback do thread nền gửi sang; chỉ luồng chính được chạm vào Tk.
+        self._ui_queue = queue.Queue()
 
         try:
             self._windows_set_titlebar_color = lambda *_args, **_kwargs: None
         except Exception:
             pass
 
-        self.state = state or globals()["state"]
+        # Không đặt tên self.state: Tk() đã có phương thức state() riêng.
+        self.app_state = state or app_state_singleton
         self.event_bus = event_bus
         self.enable_local_preview = enable_local_preview
 
-        with self.state.lock:
-            self.state.my_name = my_name
-            self.state.my_status = my_status
+        with self.app_state.lock:
+            self.app_state.my_name = my_name
+            self.app_state.my_status = my_status
 
         self.controller = controller or Controller(
             self, standalone_demo=self.enable_local_preview
@@ -81,50 +85,57 @@ class MainWindow(ctk.CTk):
             self.controller.change_status(status)
 
     def refresh_sidebar(self):
-        with self.state.lock:
-            peers = {k: dict(v) for k, v in self.state.peers.items()}
-            unread = dict(self.state.unread_counts)
-            active_id = self.state.active_peer_id
+        with self.app_state.lock:
+            peers = {k: dict(v) for k, v in self.app_state.peers.items()}
+            unread = dict(self.app_state.unread_counts)
+            active_id = self.app_state.active_peer_id
 
         self.sidebar.update_peers(peers, unread, active_id)
 
-    def safe_update_status(self, peer_id: str, msg_id: str, status_text: str):
-        if self._closing or not self.winfo_exists():
+    def _post_ui(self, callback):
+        """Thread nền chỉ được đẩy callback vào hàng đợi, không gọi Tk trực tiếp."""
+        if self._closing:
             return
+        self._ui_queue.put(callback)
 
+    def _drain_ui_queue(self):
+        while True:
+            try:
+                callback = self._ui_queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                callback()
+            except Exception:
+                pass
+
+    def safe_update_status(self, peer_id: str, msg_id: str, status_text: str):
         def _apply():
             if self._closing or not self.winfo_exists():
                 return
-            with self.state.lock:
-                is_active = self.state.active_peer_id == peer_id
+            with self.app_state.lock:
+                is_active = self.app_state.active_peer_id == peer_id
             if is_active:
                 self.chat_panel.update_message_status(msg_id, status_text)
 
-        try:
-            self.after(0, _apply)
-        except Exception:
-            pass
+        self._post_ui(_apply)
 
     def safe_progress(self, peer_id: str, percent: float, text: str):
-        if self._closing or not self.winfo_exists():
-            return
-
         def _apply():
             if self._closing or not self.winfo_exists():
                 return
-            with self.state.lock:
-                is_active = self.state.active_peer_id == peer_id
+            with self.app_state.lock:
+                is_active = self.app_state.active_peer_id == peer_id
             if is_active:
                 self.chat_panel.update_progress(percent, text)
 
-        try:
-            self.after(0, _apply)
-        except Exception:
-            pass
+        self._post_ui(_apply)
 
     def _poll_event_bus(self):
         if self._closing or not self.winfo_exists():
             return
+
+        self._drain_ui_queue()
 
         if self.event_bus is not None:
             for _ in range(100):
@@ -138,14 +149,18 @@ class MainWindow(ctk.CTk):
                 if not event:
                     break
                 if self.controller and hasattr(self.controller, "process_event"):
-                    self.controller.process_event(event)
+                    try:
+                        self.controller.process_event(event)
+                    except Exception:
+                        # Một event lỗi không được làm chết vòng poll.
+                        pass
 
         if not self._closing and self.winfo_exists():
             self._poll_after_id = self.after(100, self._poll_event_bus)
 
     def _seed_demo_data(self):
-        with self.state.lock:
-            self.state.peers = {
+        with self.app_state.lock:
+            self.app_state.peers = {
                 "p_hieu": {
                     "peer_id": "p_hieu",
                     "name": "Hiếu",
@@ -161,8 +176,8 @@ class MainWindow(ctk.CTk):
                     "status": "offline",
                 },
             }
-            self.state.active_peer_id = "p_hieu"
-            self.state.chat_history["p_hieu"] = [
+            self.app_state.active_peer_id = "p_hieu"
+            self.app_state.chat_history["p_hieu"] = [
                 {
                     "msg_id": "demo-init-1",
                     "sender_name": "Hệ thống",
@@ -181,10 +196,10 @@ class MainWindow(ctk.CTk):
                     "delivery_status": "Đã nhận",
                 },
             ]
-            history = list(self.state.chat_history["p_hieu"])
-            peers = {k: dict(v) for k, v in self.state.peers.items()}
-            unread = dict(self.state.unread_counts)
-            active_id = self.state.active_peer_id
+            history = list(self.app_state.chat_history["p_hieu"])
+            peers = {k: dict(v) for k, v in self.app_state.peers.items()}
+            unread = dict(self.app_state.unread_counts)
+            active_id = self.app_state.active_peer_id
 
         self.sidebar.update_peers(peers, unread, active_id)
         self.chat_panel.render_messages(history)
@@ -215,24 +230,23 @@ class MainWindow(ctk.CTk):
         def _push():
             if self._closing or not self.winfo_exists():
                 return
-            with self.state.lock:
-                self.state.chat_history.setdefault("p_hieu", []).append(incoming_online)
-                self.state.chat_history.setdefault("p_duong", []).append(
+            with self.app_state.lock:
+                self.app_state.chat_history.setdefault("p_hieu", []).append(
+                    incoming_online
+                )
+                self.app_state.chat_history.setdefault("p_duong", []).append(
                     incoming_offline_peer
                 )
-                is_active_hieu = self.state.active_peer_id == "p_hieu"
-                if self.state.active_peer_id != "p_duong":
-                    self.state.unread_counts["p_duong"] = (
-                        self.state.unread_counts.get("p_duong", 0) + 1
+                is_active_hieu = self.app_state.active_peer_id == "p_hieu"
+                if self.app_state.active_peer_id != "p_duong":
+                    self.app_state.unread_counts["p_duong"] = (
+                        self.app_state.unread_counts.get("p_duong", 0) + 1
                     )
             if is_active_hieu:
                 self.chat_panel.append_single_message(incoming_online)
             self.refresh_sidebar()
 
-        try:
-            self.after(0, _push)
-        except Exception:
-            pass
+        self._post_ui(_push)
 
     def _on_close(self):
         self._closing = True
@@ -243,10 +257,10 @@ class MainWindow(ctk.CTk):
                 pass
             self._poll_after_id = None
 
-        with self.state.lock:
-            active_id = self.state.active_peer_id
+        with self.app_state.lock:
+            active_id = self.app_state.active_peer_id
             if active_id:
-                self.state.drafts[active_id] = self.chat_panel.get_current_input()
+                self.app_state.drafts[active_id] = self.chat_panel.get_current_input()
 
         if self.controller and hasattr(self.controller, "shutdown"):
             try:
