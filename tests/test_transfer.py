@@ -239,6 +239,91 @@ class TransferTests(unittest.TestCase):
         self.assertNotEqual(first_id, second_id)
 
     # ------------------------------------------------------------------
+    # Độ tin cậy kết nối: cache địa chỉ và thử lại
+    # ------------------------------------------------------------------
+    def test_send_uses_cached_address_when_discovery_expires(self):
+        data = b"noi dung da cache"
+        source = self.make_source("cache.txt", data)
+
+        first = file_service.send_file(self.receiver_id, source)
+        self.wait_for_event(
+            config.EVENT_TRANSFER_FINISHED,
+            transfer_id=first,
+            direction=config.TRANSFER_DIRECTION_RECEIVE,
+        )
+        self.wait_for_event(
+            config.EVENT_TRANSFER_FINISHED,
+            transfer_id=first,
+            direction=config.TRANSFER_DIRECTION_SEND,
+        )
+
+        # Peer hết hạn discovery, nhưng địa chỉ đã được file_service ghi nhớ.
+        del self.addresses[self.receiver_id]
+
+        second = file_service.send_file(self.receiver_id, source)
+        received = self.wait_for_event(
+            config.EVENT_TRANSFER_FINISHED,
+            transfer_id=second,
+            direction=config.TRANSFER_DIRECTION_RECEIVE,
+        )
+        sent = self.wait_for_event(
+            config.EVENT_TRANSFER_FINISHED,
+            transfer_id=second,
+            direction=config.TRANSFER_DIRECTION_SEND,
+        )
+
+        self.assertEqual(sent.payload["total_bytes"], len(data))
+        self.assertEqual(Path(received.payload["local_path"]).read_bytes(), data)
+
+    def test_remember_peer_allows_send_after_discovery_expires(self):
+        file_service.configure(
+            self.sender_id, "Sender", 50000, lambda peer_id: None, self.bus
+        )
+        file_service.remember_peer(self.receiver_id, "127.0.0.1", self.tcp.tcp_port)
+
+        source = self.make_source("remember.txt", b"da ghi nho")
+        transfer_id = file_service.send_file(self.receiver_id, source)
+
+        received = self.wait_for_event(
+            config.EVENT_TRANSFER_FINISHED,
+            transfer_id=transfer_id,
+            direction=config.TRANSFER_DIRECTION_RECEIVE,
+        )
+        self.assertEqual(
+            Path(received.payload["local_path"]).read_bytes(), b"da ghi nho"
+        )
+
+    def test_connect_retries_after_transient_failure(self):
+        refused = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        refused.bind(("127.0.0.1", 0))
+        refused_port = refused.getsockname()[1]
+        refused.close()
+
+        good = dict(self.addresses[self.receiver_id])
+        calls = {"count": 0}
+
+        def flaky_get(peer_id):
+            if peer_id != self.receiver_id:
+                return None
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return {"ip": "127.0.0.1", "tcp_port": refused_port}
+            return good
+
+        file_service.configure(self.sender_id, "Sender", 50000, flaky_get, self.bus)
+
+        source = self.make_source("retry.txt", b"thu lai")
+        transfer_id = file_service.send_file(self.receiver_id, source)
+
+        sent = self.wait_for_event(
+            config.EVENT_TRANSFER_FINISHED,
+            transfer_id=transfer_id,
+            direction=config.TRANSFER_DIRECTION_SEND,
+        )
+        self.assertGreaterEqual(calls["count"], 2)
+        self.assertEqual(sent.payload["total_bytes"], len(b"thu lai"))
+
+    # ------------------------------------------------------------------
     # Lỗi và ngắt kết nối
     # ------------------------------------------------------------------
     def test_closing_mid_transfer_removes_part_file(self):

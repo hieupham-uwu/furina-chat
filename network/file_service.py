@@ -40,6 +40,8 @@ _stop_event = threading.Event()
 _local_peer: Optional[Tuple[str, str, int]] = None
 _get_peer: Optional[Callable[[str], Optional[Dict[str, Any]]]] = None
 _bus: Any = None
+# Địa chỉ peer lần cuối còn thấy trong discovery, để gửi file khi peer đã hết hạn.
+_peer_cache: Dict[str, Dict[str, Any]] = {}
 
 
 # ----------------------------------------------------------------------
@@ -62,6 +64,8 @@ def configure(peer_id, peer_name, tcp_port, get_peer, event_bus):
     _local_peer = (peer_id, peer_name, tcp_port)
     _get_peer = get_peer
     _bus = event_bus
+    with _lock:
+        _peer_cache.clear()
     _stop_event.clear()
 
 
@@ -226,33 +230,75 @@ def stop():
 # ----------------------------------------------------------------------
 # Phía gửi
 # ----------------------------------------------------------------------
+def remember_peer(peer_id, ip, tcp_port):
+    """Ghi nhớ địa chỉ peer để vẫn gửi được khi discovery đã hết hạn."""
+    if not isinstance(ip, str) or not ip.strip():
+        return
+    if type(tcp_port) is not int or not 1 <= tcp_port <= 65535:
+        return
+    with _lock:
+        _peer_cache[peer_id] = {"ip": ip, "tcp_port": tcp_port}
+
+
+def _resolve_peer(peer_id):
+    """Dùng địa chỉ hiện tại hoặc địa chỉ đã ghi nhớ của peer."""
+    peer = _get_peer(peer_id)
+    if peer:
+        remember_peer(peer_id, peer["ip"], peer["tcp_port"])
+        return peer
+
+    with _lock:
+        cached = _peer_cache.get(peer_id)
+    if cached:
+        return dict(cached)
+    raise ValueError("Không tìm thấy peer trong danh sách discovery")
+
+
+def _connect_media(peer_id, local_peer):
+    """Mở kết nối media, thử lại khi lỗi mạng tạm thời."""
+    local_id, local_name, local_port = local_peer
+    max_attempts = max(1, config.FILE_CONNECT_ATTEMPTS)
+    for attempt in range(1, max_attempts + 1):
+        peer = _resolve_peer(peer_id)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        with _lock:
+            if _stop_event.is_set():
+                sock.close()
+                raise OSError("Dịch vụ truyền tệp đã dừng")
+            _sockets.add(sock)
+        try:
+            sock.settimeout(config.HI_FRAME_TIMEOUT)
+            sock.connect((peer["ip"], int(peer["tcp_port"])))
+            send_packet(sock, {
+                "type": config.TYPE_HI,
+                "peer_id": local_id,
+                "name": local_name,
+                "tcp_port": local_port,
+                "purpose": config.HI_PURPOSE_MEDIA,
+                "payload_size": 0,
+            })
+            return sock
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            _close_socket(sock)
+            with _lock:
+                _sockets.discard(sock)
+            if (
+                not isinstance(error, OSError)
+                or attempt == max_attempts
+                or _stop_event.wait(config.FILE_RETRY_BACKOFF * attempt)
+            ):
+                raise
+
+
 def _send_worker(transfer_id, peer_id, file_path, media_type):
     filename = os.path.basename(file_path)
-    local_id, local_name, local_port = _local_peer
     sock = None
     total_bytes = 0
     direction = config.TRANSFER_DIRECTION_SEND
 
     try:
         total_bytes = os.path.getsize(file_path)
-        peer = _get_peer(peer_id)
-        if peer is None:
-            raise ValueError("Không tìm thấy peer trong danh sách discovery")
-
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        with _lock:
-            _sockets.add(sock)
-
-        sock.settimeout(config.HI_FRAME_TIMEOUT)
-        sock.connect((peer["ip"], peer["tcp_port"]))
-        send_packet(sock, {
-            "type": config.TYPE_HI,
-            "peer_id": local_id,
-            "name": local_name,
-            "tcp_port": local_port,
-            "purpose": config.HI_PURPOSE_MEDIA,
-            "payload_size": 0,
-        })
+        sock = _connect_media(peer_id, _local_peer)
 
         _publish(config.EVENT_TRANSFER_STARTED, {
             "transfer_id": transfer_id,
@@ -310,13 +356,9 @@ def _send_worker(transfer_id, peer_id, file_path, media_type):
             "total_bytes": total_bytes,
             "media_type": media_type,
         })
-    except (OSError, EOFError, ValueError, KeyError, TimeoutError) as error:
+    except (OSError, EOFError, ValueError, KeyError, TypeError) as error:
         if not _stop_event.is_set():
-            reason = str(error)
-            if isinstance(error, TimeoutError):
-                reason = "Chưa nhận được xác nhận từ máy nhận"
-            if not reason:
-                reason = error.__class__.__name__
+            reason = str(error) or error.__class__.__name__
             _publish(config.EVENT_TRANSFER_FAILED, {
                 "transfer_id": transfer_id,
                 "peer_id": peer_id,

@@ -7,7 +7,6 @@ from core.state import state as default_state
 from ui.chat_panel import _get_downloads_dir
 
 SEND_ACK_TIMEOUT = 8.0
-FILE_ACK_TIMEOUT = max(15.0, float(getattr(config, "FILE_ACK_TIMEOUT", 15.0)))
 IDLE_AWAY_SECONDS = float(getattr(config, "IDLE_AWAY_SECONDS", 60.0))
 MAX_MSG_CHARS = 4000
 TYPE_MSG = getattr(config, "TYPE_MSG", "MSG")
@@ -373,24 +372,28 @@ class Controller:
 
         self.main_window.chat_panel.append_single_message(msg_obj)
         self.main_window.refresh_sidebar()
-        self._schedule_unsent_timeout(active_id, msg_obj, FILE_ACK_TIMEOUT)
 
-        if self.file_service and hasattr(self.file_service, "send_file"):
-            try:
-                tid = self.file_service.send_file(active_id, file_path, norm_type)
-                if tid:
-                    with self.state.lock:
-                        self.state.transfers[tid] = {
-                            "transfer_id": tid,
-                            "peer_id": active_id,
-                            "direction": "send",
-                            "filename": fname,
-                            "total_bytes": fsize,
-                            "bytes_done": 0,
-                            "msg_obj": msg_obj,
-                        }
-            except Exception:
-                self._mark_unsent(active_id, msg_obj)
+        try:
+            send_file = getattr(self.file_service, "send_file", None)
+            tid = send_file(active_id, file_path, norm_type) if send_file else None
+        except Exception:
+            self._mark_unsent(active_id, msg_obj)
+            return
+
+        if not tid:
+            self._mark_unsent(active_id, msg_obj)
+            return
+
+        with self.state.lock:
+            self.state.transfers[tid] = {
+                "transfer_id": tid,
+                "peer_id": active_id,
+                "direction": "send",
+                "filename": fname,
+                "total_bytes": fsize,
+                "bytes_done": 0,
+                "msg_obj": msg_obj,
+            }
 
     def _cleanup_failed_transfer_files(self, fname: str, local_path: str = ""):
         dl_dir = _get_downloads_dir()
@@ -440,6 +443,10 @@ class Controller:
                 is_active = pid == self.state.active_peer_id
                 peer_name = existing.get("name") or existing.get("peer_name") or "Unknown"
                 peer_status = existing.get("status", "online")
+
+            remember_peer = getattr(self.file_service, "remember_peer", None)
+            if remember_peer:
+                remember_peer(pid, existing.get("ip"), existing.get("tcp_port"))
 
             if is_active:
                 self.main_window.chat_panel.set_header(
