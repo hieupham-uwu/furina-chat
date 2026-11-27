@@ -36,6 +36,12 @@ VALID_STATUSES = (STATUS_ONLINE, STATUS_AWAY)
 EVENT_PEER_UPDATED = "peer_updated"
 EVENT_PEER_OFFLINE = "peer_offline"
 
+# Sự kiện truyền file
+EVENT_TRANSFER_STARTED = "transfer_started"
+EVENT_TRANSFER_PROGRESS = "transfer_progress"
+EVENT_TRANSFER_FINISHED = "transfer_finished"
+EVENT_TRANSFER_FAILED = "transfer_failed"
+
 # Các trường công khai của một peer (bỏ last_seen khi trả ra ngoài)
 PEER_FIELDS: Tuple[str, ...] = ("peer_id", "name", "ip", "tcp_port", "status")
 
@@ -101,7 +107,25 @@ FILE_CHUNK_SIZE: int = 65_536  # 64 KiB
 
 
 # ==============================================================================
-# 6. Thời gian chờ (Timeouts)
+# 6. Truyền file (media)
+# ==============================================================================
+# Purpose của gói HI: "chat" mở kết nối chat, "media" mở kết nối truyền file
+HI_PURPOSE_CHAT = "chat"
+HI_PURPOSE_MEDIA = "media"
+
+# Hướng truyền dùng trong payload sự kiện
+TRANSFER_DIRECTION_SEND = "send"
+TRANSFER_DIRECTION_RECEIVE = "receive"
+
+# Tên thư mục nhận file, đặt cạnh main.py
+DOWNLOADS_DIR_NAME = "downloads"
+
+# Thời gian chờ tối đa khi join luồng gửi file (giây)
+FILE_JOIN_TIMEOUT: float = 2.0
+
+
+# ==============================================================================
+# 7. Thời gian chờ (Timeouts)
 # ==============================================================================
 # Thời hạn tối đa để nhận trọn vẹn một frame HI (giây)
 HI_FRAME_TIMEOUT: float = 5.0

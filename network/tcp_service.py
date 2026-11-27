@@ -18,7 +18,11 @@ from threading import Lock, Thread
 from uuid import UUID
 
 import config
+from network import file_service
 from network.protocol import recv_header, send_packet
+
+
+_DEFAULT_MEDIA_HANDLER = object()
 
 
 def send_chat_hi(sock, peer_id, name, tcp_port):
@@ -27,16 +31,13 @@ def send_chat_hi(sock, peer_id, name, tcp_port):
         "peer_id": peer_id,
         "name": name,
         "tcp_port": tcp_port,
-        "purpose": "chat",
+        "purpose": config.HI_PURPOSE_CHAT,
         "payload_size": 0,
     })
 
 
-def recv_chat_hi(sock):
-    return _recv_hi(sock, expected_purpose="chat")
-
-
-def _recv_hi(sock, *, expected_purpose=None):
+def recv_hi(sock):
+    """Đọc trọn một frame HI (chat hoặc media) trong thời hạn cho phép."""
     previous_timeout = sock.gettimeout()
 
     # Mọi lần đọc của cùng một frame HI dùng chung một hạn chót.
@@ -46,10 +47,11 @@ def _recv_hi(sock, *, expected_purpose=None):
     finally:
         sock.settimeout(previous_timeout)
 
-    allowed_purposes = (expected_purpose,) if expected_purpose else ("chat", "media")
-    if header["type"] != config.TYPE_HI or header.get("purpose") not in allowed_purposes:
-        expected = expected_purpose or "chat or media"
-        raise ValueError(f"Expected a {expected} HI frame")
+    if header["type"] != config.TYPE_HI or header.get("purpose") not in (
+        config.HI_PURPOSE_CHAT,
+        config.HI_PURPOSE_MEDIA,
+    ):
+        raise ValueError("Expected a chat or media HI frame")
 
     peer_id = header.get("peer_id")
     if not isinstance(peer_id, str):
@@ -64,6 +66,13 @@ def _recv_hi(sock, *, expected_purpose=None):
     if type(port) is not int or not 1 <= port <= 65535:
         raise ValueError("Invalid TCP port")
 
+    return header
+
+
+def recv_chat_hi(sock):
+    header = recv_hi(sock)
+    if header["purpose"] != config.HI_PURPOSE_CHAT:
+        raise ValueError("Expected a chat HI frame")
     return header
 
 
@@ -202,15 +211,16 @@ class _ChatConnection:
 
 
 class TCPService:
-    """Lắng nghe chat và bàn giao socket media qua on_media(sock, peer_id).
+    """Lắng nghe chat và chuyển socket media cho file_service mặc định.
 
-    Sau khi nhận socket, on_media phụ trách đọc, phản hồi và đóng socket.
+    on_media=None tắt nhận media. Callback riêng nhận (sock, peer_id) và
+    chịu trách nhiệm đọc, phản hồi và đóng socket sau khi bàn giao.
     """
 
     def __init__(
         self, peer_id, peer_name, get_peer, event_bus,
         host=config.DEFAULT_TCP_HOST, port=config.DEFAULT_TCP_PORT,
-        *, on_media=None,
+        *, on_media=_DEFAULT_MEDIA_HANDLER,
     ):
         self.peer_id = peer_id
         self.peer_name = peer_name
@@ -397,15 +407,15 @@ class TCPService:
 
     def _accept_connection(self, sock, local_peer):
         peer_id = None
-        purpose = "chat"
+        purpose = config.HI_PURPOSE_CHAT
         try:
-            greeting = _recv_hi(sock)
+            greeting = recv_hi(sock)
             peer_id = greeting["peer_id"]
             purpose = greeting["purpose"]
             if peer_id == self.peer_id:
                 raise ValueError(f"Cannot open {purpose} with yourself")
 
-            if purpose == "media":
+            if purpose == config.HI_PURPOSE_MEDIA:
                 self._hand_off_media(sock, peer_id)
                 return
 
@@ -428,21 +438,30 @@ class TCPService:
         self._read_chat(peer_id, chat)
 
     def _hand_off_media(self, sock, peer_id):
-        if self._on_media is None:
+        handler = self._on_media
+        if handler is None:
             raise ValueError("No media handler is configured")
+
+        uses_file_service = handler is _DEFAULT_MEDIA_HANDLER
+        if uses_file_service:
+            handler = file_service.handle_incoming
 
         with self._lock:
             if sock not in self._sockets:
                 return
-            # Chuyển quyền đóng socket sang bên nhận tệp trước khi gọi hàm.
-            self._sockets.remove(sock)
+            if not uses_file_service:
+                # Callback riêng tiếp quản socket, kể cả khi TCP dừng.
+                self._sockets.remove(sock)
 
         try:
-            self._on_media(sock, peer_id)
+            handler(sock, peer_id)
         except Exception as error:
-            # Nếu hàm nhận tệp lỗi trước khi tự đóng, đóng socket tại đây.
             self._close_socket(sock)
             self._failed("handle_media", peer_id, error)
+        finally:
+            if uses_file_service:
+                with self._lock:
+                    self._sockets.discard(sock)
 
     def _register_chat(self, peer_id, sock, outgoing):
         chat = _ChatConnection(sock, outgoing)
