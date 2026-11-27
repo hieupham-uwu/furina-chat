@@ -198,23 +198,6 @@ class MainWindow(ctk.CTk):
         except Exception:
             pass
 
-    def safe_progress(self, peer_id: str, percent: float, text: str):
-        if self._closing or not self.winfo_exists():
-            return
-
-        def _apply():
-            if self._closing or not self.winfo_exists():
-                return
-            with self.app_state.lock:
-                is_active = self.app_state.active_peer_id == str(peer_id)
-            if is_active:
-                self.chat_panel.update_progress(percent, text)
-
-        try:
-            self.after(0, _apply)
-        except Exception:
-            pass
-
     def _next_bus_event(self):
         bus = self.event_bus
         if bus is None:

@@ -14,7 +14,9 @@ transfer_failed (xem config.EVENT_TRANSFER_*).
 import os
 import socket
 import threading
+import time
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
 from typing import Any, Callable, Dict, Optional, Tuple
@@ -35,13 +37,21 @@ _RESERVED_NAMES = (
 _lock = Lock()
 _rename_lock = Lock()
 _sockets = set()
-_send_threads = set()
+_send_transfers = {}
 _stop_event = threading.Event()
 _local_peer: Optional[Tuple[str, str, int]] = None
 _get_peer: Optional[Callable[[str], Optional[Dict[str, Any]]]] = None
 _bus: Any = None
 # Địa chỉ peer lần cuối còn thấy trong discovery, để gửi file khi peer đã hết hạn.
 _peer_cache: Dict[str, Dict[str, Any]] = {}
+
+
+@dataclass
+class _SendTransfer:
+    cancelled: threading.Event = field(default_factory=threading.Event)
+    sock: Optional[socket.socket] = None
+    thread: Optional[threading.Thread] = None
+    can_cancel: bool = True
 
 
 # ----------------------------------------------------------------------
@@ -86,16 +96,36 @@ def send_file(peer_id, path, media_type=config.TYPE_FILE):
         raise FileNotFoundError(file_path)
 
     transfer_id = str(uuid.uuid4())
-    thread = threading.Thread(
+    transfer = _SendTransfer()
+    transfer.thread = threading.Thread(
         target=_send_worker,
-        args=(transfer_id, peer_id, file_path, media_type),
+        args=(transfer_id, transfer, peer_id, file_path, media_type),
         name=f"file-send-{transfer_id[:8]}",
         daemon=True,
     )
     with _lock:
-        _send_threads.add(thread)
-    thread.start()
+        if _stop_event.is_set():
+            raise RuntimeError("Dịch vụ truyền tệp đã dừng")
+        _send_transfers[transfer_id] = transfer
+        try:
+            transfer.thread.start()
+        except RuntimeError:
+            del _send_transfers[transfer_id]
+            raise
     return transfer_id
+
+
+def cancel_send(transfer_id):
+    """Dừng lượt gửi nếu máy gửi chưa bắt đầu chuyển khối dữ liệu cuối."""
+    with _lock:
+        transfer = _send_transfers.get(transfer_id)
+        if transfer is None or not transfer.can_cancel or transfer.cancelled.is_set():
+            return False
+        transfer.cancelled.set()
+        sock = transfer.sock
+    if sock is not None:
+        _close_socket(sock)
+    return True
 
 
 def handle_incoming(sock, peer_id):
@@ -131,30 +161,25 @@ def handle_incoming(sock, peer_id):
         DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
         part_path = DOWNLOAD_DIR / f".{transfer_id}.part"
 
-        _publish(config.EVENT_TRANSFER_STARTED, {
+        details = {
             "transfer_id": transfer_id,
             "peer_id": peer_id,
             "direction": direction,
             "filename": filename,
             "total_bytes": total_bytes,
             "media_type": media_type,
-        })
+        }
+        _publish(config.EVENT_TRANSFER_STARTED, details)
 
         received = 0
+        last_update = float("-inf")
         with open(part_path, "wb") as file:
             while received < total_bytes:
                 size = min(config.FILE_CHUNK_SIZE, total_bytes - received)
                 chunk = recv_exact(sock, size)
                 file.write(chunk)
                 received += len(chunk)
-                _publish(config.EVENT_TRANSFER_PROGRESS, {
-                    "transfer_id": transfer_id,
-                    "peer_id": peer_id,
-                    "direction": direction,
-                    "filename": filename,
-                    "bytes_done": received,
-                    "total_bytes": total_bytes,
-                })
+                last_update = _publish_progress(details, received, last_update)
 
         with _rename_lock:
             target = _unique_download_path(filename)
@@ -183,8 +208,12 @@ def handle_incoming(sock, peer_id):
                 pass
 
         reason = str(error)
+        message = "Không nhận được tệp."
         if isinstance(error, TimeoutError):
             reason = "Quá thời gian chờ dữ liệu từ máy gửi"
+            message = reason + "."
+        elif isinstance(error, (EOFError, ConnectionError)):
+            message = "Lượt nhận tệp bị gián đoạn."
         if not reason:
             reason = error.__class__.__name__
 
@@ -199,6 +228,7 @@ def handle_incoming(sock, peer_id):
                 "media_type": media_type,
                 "total_bytes": total_bytes,
                 "reason": reason,
+                "message": message,
             })
     finally:
         _close_socket(sock)
@@ -212,19 +242,22 @@ def stop():
 
     with _lock:
         sockets = list(_sockets)
-        threads = list(_send_threads)
+        transfers = list(_send_transfers.values())
+        for transfer in transfers:
+            transfer.cancelled.set()
 
     for sock in sockets:
         _close_socket(sock)
 
     current = threading.current_thread()
-    for thread in threads:
+    for transfer in transfers:
+        thread = transfer.thread
         if thread is not current and thread.is_alive():
             thread.join(timeout=config.FILE_JOIN_TIMEOUT)
 
     with _lock:
         _sockets.clear()
-        _send_threads.clear()
+        _send_transfers.clear()
 
 
 # ----------------------------------------------------------------------
@@ -254,7 +287,7 @@ def _resolve_peer(peer_id):
     raise ValueError("Không tìm thấy peer trong danh sách discovery")
 
 
-def _connect_media(peer_id, local_peer):
+def _connect_media(peer_id, local_peer, transfer):
     """Mở kết nối media, thử lại khi lỗi mạng tạm thời."""
     local_id, local_name, local_port = local_peer
     max_attempts = max(1, config.FILE_CONNECT_ATTEMPTS)
@@ -262,10 +295,11 @@ def _connect_media(peer_id, local_peer):
         peer = _resolve_peer(peer_id)
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         with _lock:
-            if _stop_event.is_set():
+            if _stop_event.is_set() or transfer.cancelled.is_set():
                 sock.close()
-                raise OSError("Dịch vụ truyền tệp đã dừng")
+                raise InterruptedError("Lượt gửi đã dừng")
             _sockets.add(sock)
+            transfer.sock = sock
         try:
             sock.settimeout(config.HI_FRAME_TIMEOUT)
             sock.connect((peer["ip"], int(peer["tcp_port"])))
@@ -282,34 +316,35 @@ def _connect_media(peer_id, local_peer):
             _close_socket(sock)
             with _lock:
                 _sockets.discard(sock)
+                transfer.sock = None
             if (
                 not isinstance(error, OSError)
                 or attempt == max_attempts
-                or _stop_event.wait(config.FILE_RETRY_BACKOFF * attempt)
+                or transfer.cancelled.wait(config.FILE_RETRY_BACKOFF * attempt)
             ):
                 raise
 
 
-def _send_worker(transfer_id, peer_id, file_path, media_type):
+def _send_worker(transfer_id, transfer, peer_id, file_path, media_type):
     filename = os.path.basename(file_path)
     sock = None
-    total_bytes = 0
-    direction = config.TRANSFER_DIRECTION_SEND
+    details = {
+        "transfer_id": transfer_id, "peer_id": peer_id, "filename": filename,
+        "direction": config.TRANSFER_DIRECTION_SEND, "media_type": media_type, "total_bytes": 0,
+    }
+    failure_message = "Không đọc được tệp để gửi."
 
     try:
         total_bytes = os.path.getsize(file_path)
-        sock = _connect_media(peer_id, _local_peer)
+        details["total_bytes"] = total_bytes
+        failure_message = "Không kết nối được với máy nhận tệp."
+        sock = _connect_media(peer_id, _local_peer, transfer)
+        _publish(config.EVENT_TRANSFER_STARTED, details)
 
-        _publish(config.EVENT_TRANSFER_STARTED, {
-            "transfer_id": transfer_id,
-            "peer_id": peer_id,
-            "direction": direction,
-            "filename": filename,
-            "total_bytes": total_bytes,
-            "media_type": media_type,
-        })
-
+        failure_message = "Đường truyền gửi tệp bị gián đoạn."
         sock.settimeout(config.FILE_TRANSFER_TIMEOUT)
+        if total_bytes == 0:
+            _begin_final_chunk(transfer)
         sock.sendall(encode_header({
             "type": media_type,
             "filename": filename,
@@ -318,23 +353,27 @@ def _send_worker(transfer_id, peer_id, file_path, media_type):
         }))
 
         sent = 0
+        last_update = float("-inf")
         with open(file_path, "rb") as file:
             while sent < total_bytes:
                 size = min(config.FILE_CHUNK_SIZE, total_bytes - sent)
                 chunk = file.read(size)
                 if not chunk:
                     raise ValueError("Tệp đã thay đổi trong lúc gửi")
-                sock.sendall(chunk)
-                sent += len(chunk)
-                _publish(config.EVENT_TRANSFER_PROGRESS, {
-                    "transfer_id": transfer_id,
-                    "peer_id": peer_id,
-                    "direction": direction,
-                    "filename": filename,
-                    "bytes_done": sent,
-                    "total_bytes": total_bytes,
-                })
+                if sent + len(chunk) == total_bytes:
+                    _begin_final_chunk(transfer)
+                pending = memoryview(chunk)
+                while pending:
+                    if transfer.cancelled.is_set():
+                        raise InterruptedError("Lượt gửi đã dừng")
+                    written = sock.send(pending)
+                    if not written:
+                        raise EOFError("Kết nối gửi tệp đã đóng")
+                    sent += written
+                    pending = pending[written:]
+                last_update = _publish_progress(details, sent, last_update)
 
+        failure_message = "Không nhận được xác nhận hợp lệ từ máy nhận tệp."
         sock.settimeout(config.FILE_ACK_TIMEOUT)
         try:
             ack = recv_header(sock)
@@ -344,37 +383,30 @@ def _send_worker(transfer_id, peer_id, file_path, media_type):
         if ack.get("transfer_id") != transfer_id:
             raise ValueError("Xác nhận không khớp transfer_id")
         if ack["type"] == config.TYPE_FILE_ERROR:
+            failure_message = "Máy nhận không lưu được tệp."
             raise ValueError(ack.get("reason") or "Máy nhận báo lỗi")
         if ack["type"] != config.TYPE_FILE_OK:
             raise ValueError("Phản hồi xác nhận không hợp lệ")
 
-        _publish(config.EVENT_TRANSFER_FINISHED, {
-            "transfer_id": transfer_id,
-            "peer_id": peer_id,
-            "direction": direction,
-            "filename": filename,
-            "total_bytes": total_bytes,
-            "media_type": media_type,
-        })
+        _publish(config.EVENT_TRANSFER_FINISHED, details)
     except (OSError, EOFError, ValueError, KeyError, TypeError) as error:
+        with _lock:
+            transfer.can_cancel = False
+            cancelled = transfer.cancelled.is_set()
         if not _stop_event.is_set():
-            reason = str(error) or error.__class__.__name__
-            _publish(config.EVENT_TRANSFER_FAILED, {
-                "transfer_id": transfer_id,
-                "peer_id": peer_id,
-                "direction": direction,
-                "filename": filename,
-                "media_type": media_type,
-                "total_bytes": total_bytes,
-                "reason": reason,
-            })
+            if cancelled:
+                _publish(config.EVENT_TRANSFER_CANCELLED, details)
+            else:
+                _publish(config.EVENT_TRANSFER_FAILED, {
+                    **details, "reason": str(error) or error.__class__.__name__, "message": failure_message,
+                })
     finally:
         if sock is not None:
             _close_socket(sock)
             with _lock:
                 _sockets.discard(sock)
         with _lock:
-            _send_threads.discard(threading.current_thread())
+            _send_transfers.pop(transfer_id, None)
 
 
 # ----------------------------------------------------------------------
@@ -383,6 +415,21 @@ def _send_worker(transfer_id, peer_id, file_path, media_type):
 def _publish(event_name, payload):
     if _bus is not None:
         _bus.publish(event_name, payload)
+
+
+def _publish_progress(details, done, last_update):
+    now = time.monotonic()
+    if done == details["total_bytes"] or now - last_update >= config.FILE_PROGRESS_INTERVAL:
+        _publish(config.EVENT_TRANSFER_PROGRESS, {**details, "bytes_done": done})
+        return now
+    return last_update
+
+
+def _begin_final_chunk(transfer):
+    with _lock:
+        if transfer.cancelled.is_set():
+            raise InterruptedError("Lượt gửi đã dừng")
+        transfer.can_cancel = False
 
 
 def _safe_filename(raw):

@@ -126,7 +126,7 @@ class TransferTests(unittest.TestCase):
             event for event in progress
             if event.payload["direction"] == config.TRANSFER_DIRECTION_SEND
         ]
-        self.assertGreaterEqual(len(sent_progress), 3)
+        self.assertGreaterEqual(len(sent_progress), 2)
         self.assertEqual(sent_progress[-1].payload["bytes_done"], len(data))
 
         # Kết nối media không được biến thành kết nối chat.
@@ -372,6 +372,56 @@ class TransferTests(unittest.TestCase):
         self.assertEqual(
             self.transfers(config.EVENT_TRANSFER_FINISHED, transfer_id), []
         )
+
+    def test_receive_completes_while_another_send_is_in_progress_and_cancelled(self):
+        sending = threading.Event()
+        resume = threading.Event()
+        self.addCleanup(resume.set)
+        publish_progress = file_service._publish_progress
+
+        def pause_outgoing(details, done, last_update):
+            stamp = publish_progress(details, done, last_update)
+            if details["direction"] == config.TRANSFER_DIRECTION_SEND:
+                sending.set()
+                resume.wait(5)
+            return stamp
+
+        source = self.make_source("a-to-b.bin", b"a" * (config.FILE_CHUNK_SIZE * 4))
+        with patch.object(file_service, "_publish_progress", pause_outgoing):
+            outgoing = file_service.send_file(self.receiver_id, source)
+            self.assertTrue(sending.wait(3))
+            self.wait_for_event(
+                config.EVENT_TRANSFER_STARTED, transfer_id=outgoing,
+                direction=config.TRANSFER_DIRECTION_RECEIVE,
+            )
+            incoming = str(uuid.uuid4())
+            data = b"C to A while A is sending" * 4000
+            with socket.create_connection(("127.0.0.1", self.tcp.tcp_port), timeout=3) as sock:
+                send_packet(sock, {
+                    "type": config.TYPE_HI, "peer_id": str(uuid.uuid4()), "name": "C",
+                    "tcp_port": 50001, "purpose": config.HI_PURPOSE_MEDIA, "payload_size": 0,
+                })
+                send_packet(sock, {
+                    "type": config.TYPE_FILE, "filename": "c-to-a.bin",
+                    "transfer_id": incoming, "payload_size": len(data),
+                }, data)
+                self.assertEqual(recv_header(sock)["type"], config.TYPE_FILE_OK)
+
+            self.assertEqual((self.download_dir / "c-to-a.bin").read_bytes(), data)
+            self.assertEqual(self.transfers(config.EVENT_TRANSFER_FINISHED, outgoing), [])
+            self.assertTrue(file_service.cancel_send(outgoing))
+            self.assertFalse(file_service.cancel_send(outgoing))
+            resume.set()
+
+            self.wait_for_event(config.EVENT_TRANSFER_CANCELLED, transfer_id=outgoing)
+            self.wait_for_event(
+                config.EVENT_TRANSFER_FAILED, transfer_id=outgoing,
+                direction=config.TRANSFER_DIRECTION_RECEIVE,
+            )
+
+        self.assertTrue(source.exists())
+        self.assertFalse((self.download_dir / source.name).exists())
+        self.assertEqual(list(self.download_dir.glob("*.part")), [])
 
     def test_sender_reports_file_error_from_receiver(self):
         errors = []

@@ -41,6 +41,7 @@ EVENT_TRANSFER_STARTED = "transfer_started"
 EVENT_TRANSFER_PROGRESS = "transfer_progress"
 EVENT_TRANSFER_FINISHED = "transfer_finished"
 EVENT_TRANSFER_FAILED = "transfer_failed"
+EVENT_TRANSFER_CANCELLED = "transfer_cancelled"
 
 # Các trường công khai của một peer (bỏ last_seen khi trả ra ngoài)
 PEER_FIELDS: Tuple[str, ...] = ("peer_id", "name", "ip", "tcp_port", "status")
@@ -104,6 +105,9 @@ MAX_MESSAGE_LENGTH: int = 4_000
 
 # Kích thước tối đa của mỗi khối (chunk) khi đọc hoặc ghi tệp (byte)
 FILE_CHUNK_SIZE: int = 65_536  # 64 KiB
+
+# Khoảng thời gian tối thiểu giữa hai lần cập nhật tiến độ (giây)
+FILE_PROGRESS_INTERVAL: float = 0.2
 
 
 # ==============================================================================

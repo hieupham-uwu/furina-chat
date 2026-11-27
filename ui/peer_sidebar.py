@@ -1,6 +1,6 @@
 import customtkinter as ctk
-from PIL import Image, ImageDraw
 import config
+from ui.avatar import initial_avatar
 
 
 class PeerSidebar(ctk.CTkFrame):
@@ -145,10 +145,6 @@ class PeerSidebar(ctk.CTkFrame):
         return "online"
 
     def _make_avatar(self, name: str, status: str) -> ctk.CTkImage:
-        size = 34
-        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(img)
-
         st = self._normalize_status(status)
         if st == "away":
             fill = (217, 119, 6, 255)
@@ -160,20 +156,7 @@ class PeerSidebar(ctk.CTkFrame):
             fill = (106, 73, 250, 255)
             dot_color = (22, 163, 74, 255)
 
-        draw.ellipse([1, 1, size - 5, size - 5], fill=fill)
-
-        initial = (name.strip()[:1] or "?").upper()
-        draw.text((10, 8), initial, fill=(255, 255, 255, 255))
-
-        r = 5
-        cx, cy = size - r - 1, size - r - 1
-        draw.ellipse(
-            [cx - r - 2, cy - r - 2, cx + r + 2, cy + r + 2],
-            fill=(255, 255, 255, 255),
-        )
-        draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=dot_color)
-
-        ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=(size, size))
+        ctk_img = initial_avatar(name, 34, fill, dot_color)
         self._avatar_cache.append(ctk_img)
         return ctk_img
 
