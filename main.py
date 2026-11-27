@@ -2,6 +2,7 @@ import argparse
 import os
 import socket
 import sys
+from ipaddress import IPv4Address
 
 _ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _ROOT_DIR not in sys.path:
@@ -47,6 +48,11 @@ def main():
         default=getattr(config, "DEFAULT_TCP_PORT", 5000),
         help="Cổng TCP lắng nghe",
     )
+    parser.add_argument(
+        "--discovery-ip",
+        type=IPv4Address,
+        help="Địa chỉ IPv4 nhận gói tìm máy, ví dụ địa chỉ broadcast của mạng Wi-Fi",
+    )
     args = parser.parse_args()
 
     display_name = _resolve_display_name(args.name)
@@ -72,6 +78,7 @@ def main():
         peer_name=display_name,
         tcp_port=args.port,
         event_bus=bus,
+        discovery_ip=str(args.discovery_ip) if args.discovery_ip is not None else None,
     )
     tcp_service = TCPService(
         peer_id=my_id,
@@ -86,11 +93,14 @@ def main():
     with app_state.lock:
         app_state.my_tcp_port = actual_tcp_port
 
+    def get_media_peer(peer_id):
+        return udp_service.get_peer(peer_id) or tcp_service.get_chat_peer(peer_id)
+
     file_service.configure(
         peer_id=my_id,
         peer_name=display_name,
         tcp_port=actual_tcp_port,
-        get_peer=udp_service.get_peer,
+        get_peer=get_media_peer,
         event_bus=bus,
     )
     udp_service.start()

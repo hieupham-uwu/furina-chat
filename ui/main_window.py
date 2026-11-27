@@ -1,5 +1,7 @@
+import gc
 import os
 import sys
+import time
 import customtkinter as ctk
 
 _ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -30,6 +32,7 @@ class MainWindow(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._poll_after_id = None
+        self._next_ui_collection = None
         self._closing = False
         self._picker_win = None
 
@@ -38,20 +41,20 @@ class MainWindow(ctk.CTk):
         except Exception:
             pass
 
-        self.state = state or AppState(my_name=my_name)
+        self.app_state = state or AppState(my_name=my_name)
         self.event_bus = event_bus
 
         norm_status = "away" if (my_status or "").lower() == "away" else "online"
-        with self.state.lock:
+        with self.app_state.lock:
             if my_name and my_name.strip():
-                self.state.my_name = my_name.strip()
-            self.state.my_status = norm_status
-            current_name = self.state.my_name
+                self.app_state.my_name = my_name.strip()
+            self.app_state.my_status = norm_status
+            current_name = self.app_state.my_name
 
         self.title(f"Furina Chat — {current_name}")
 
         self.controller = controller or Controller(
-            self, app_state=self.state, event_bus=self.event_bus
+            self, app_state=self.app_state, event_bus=self.event_bus
         )
 
         self.grid_columnconfigure(0, weight=0)
@@ -79,6 +82,20 @@ class MainWindow(ctk.CTk):
         self.bind_all("<KeyPress>", self._on_user_input_event, add="+")
 
         self._poll_after_id = self.after(50, self._poll_event_bus)
+
+    def mainloop(self, n=0):
+        if not gc.isenabled():
+            return super().mainloop(n)
+
+        # Tk image finalizers must run on the UI thread, even for widget cycles.
+        gc.disable()
+        self._next_ui_collection = time.monotonic() + 2
+        try:
+            return super().mainloop(n)
+        finally:
+            self._next_ui_collection = None
+            gc.collect()
+            gc.enable()
 
     def _on_user_input_event(self, _event):
         if self.controller:
@@ -136,17 +153,17 @@ class MainWindow(ctk.CTk):
             self.controller.set_activity_status(new_status)
 
     def refresh_sidebar(self):
-        with self.state.lock:
-            peers = {str(k): dict(v) for k, v in self.state.peers.items()}
-            unread = {str(k): v for k, v in self.state.unread_counts.items()}
-            last_act = {str(k): v for k, v in self.state.last_activity.items()}
+        with self.app_state.lock:
+            peers = {str(k): dict(v) for k, v in self.app_state.peers.items()}
+            unread = {str(k): v for k, v in self.app_state.unread_counts.items()}
+            last_act = {str(k): v for k, v in self.app_state.last_activity.items()}
             connected_ids = {
                 str(pid)
-                for pid, msgs in self.state.chat_history.items()
+                for pid, msgs in self.app_state.chat_history.items()
                 if len(msgs) > 0
             }
             active_id = (
-                str(self.state.active_peer_id) if self.state.active_peer_id else None
+                str(self.app_state.active_peer_id) if self.app_state.active_peer_id else None
             )
 
         self.sidebar.update_peers(
@@ -164,8 +181,8 @@ class MainWindow(ctk.CTk):
         def _apply():
             if self._closing or not self.winfo_exists():
                 return
-            with self.state.lock:
-                is_active = self.state.active_peer_id == str(peer_id)
+            with self.app_state.lock:
+                is_active = self.app_state.active_peer_id == str(peer_id)
             if is_active:
                 self.chat_panel.update_message_status(msg_id, status_text)
 
@@ -181,8 +198,8 @@ class MainWindow(ctk.CTk):
         def _apply():
             if self._closing or not self.winfo_exists():
                 return
-            with self.state.lock:
-                is_active = self.state.active_peer_id == str(peer_id)
+            with self.app_state.lock:
+                is_active = self.app_state.active_peer_id == str(peer_id)
             if is_active:
                 self.chat_panel.update_progress(percent, text)
 
@@ -204,6 +221,10 @@ class MainWindow(ctk.CTk):
     def _poll_event_bus(self):
         if self._closing or not self.winfo_exists():
             return
+
+        if self._next_ui_collection is not None and time.monotonic() >= self._next_ui_collection:
+            gc.collect()
+            self._next_ui_collection = time.monotonic() + 2
 
         if self.controller:
             self.controller.check_idle_away()

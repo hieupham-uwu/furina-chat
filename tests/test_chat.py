@@ -83,7 +83,7 @@ class ChatTests(unittest.TestCase):
             both_opening.wait(timeout=3)
             if local_peer[0] == self.duong.peer_id and not allow_preferred.wait(3):
                 raise TimeoutError("The first connection did not get registered")
-            connect(sock, address, local_peer, expected_peer_id)
+            return connect(sock, address, local_peer, expected_peer_id)
 
         with patch.object(tcp_service, "_connect_and_exchange_hi", wait_then_connect):
             with ThreadPoolExecutor(max_workers=2) as executor:

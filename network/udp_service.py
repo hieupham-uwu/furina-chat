@@ -1,7 +1,7 @@
 """Dịch vụ UDP discovery (HELLO) cho Furina Chat.
 
 Nhiệm vụ:
-- Phát gói HELLO định kỳ tới 255.255.255.255:9999.
+- Phát gói HELLO định kỳ tới địa chỉ discovery đã chọn, mặc định là 255.255.255.255:9999.
 - Lắng nghe HELLO của các peer khác và lưu vào bảng ``_peers``.
 - Quét định kỳ, xóa các peer không gửi HELLO trong thời gian quy định.
 
@@ -27,6 +27,8 @@ class UDPService:
         peer_name: str,
         tcp_port: int,
         event_bus: Any = None,
+        *,
+        discovery_ip: Optional[str] = None,
     ) -> None:
         if not isinstance(peer_id, str) or not peer_id.strip():
             raise ValueError("peer_id must be a non-empty string")
@@ -44,6 +46,11 @@ class UDPService:
         self.tcp_port = tcp_port
         self.status = config.STATUS_ONLINE
         self._event_bus = event_bus
+        self._hello_target = (
+            (discovery_ip, config.UDP_DISCOVERY_PORT)
+            if discovery_ip is not None
+            else config.UDP_BROADCAST_ADDR
+        )
 
         self._peers: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.Lock()
@@ -149,7 +156,7 @@ class UDPService:
 
         data = protocol.pack_udp_hello(self.peer_id, self.peer_name, self.tcp_port, status)
         try:
-            sock.sendto(data, config.UDP_BROADCAST_ADDR)
+            sock.sendto(data, self._hello_target)
         except OSError:
             # Mạng chập chờn hoặc chưa kết nối: bỏ qua, luồng vẫn sống
             pass

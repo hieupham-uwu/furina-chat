@@ -135,6 +135,39 @@ class TransferTests(unittest.TestCase):
         self.assertFalse(any(event.name == "chat_connected" for event in self.events))
         self.assertFalse(any(event.name == "operation_failed" for event in self.events))
 
+    def test_send_file_after_chat_peer_expires_from_discovery(self):
+        sender = TCPService(
+            self.sender_id, "Sender", self.addresses.get, self.bus,
+            host="127.0.0.1", port=0,
+        )
+        self.addCleanup(sender.stop)
+        port = sender.start()
+        sender.open_chat(self.receiver_id)
+        self.wait_for_event("chat_connected", peer_id=self.receiver_id)
+        self.wait_for_event("chat_connected", peer_id=self.sender_id)
+
+        self.addresses.clear()
+        self.assertEqual(
+            self.tcp.get_chat_peer(self.sender_id),
+            {"ip": "127.0.0.1", "tcp_port": port},
+        )
+        file_service.configure(
+            self.sender_id, "Sender", port, sender.get_chat_peer, self.bus,
+        )
+
+        data = b"File sent while discovery is unavailable"
+        source = self.make_source("chat-fallback.txt", data)
+        transfer_id = file_service.send_file(self.receiver_id, source)
+        self.wait_for_event(
+            config.EVENT_TRANSFER_FINISHED,
+            transfer_id=transfer_id,
+            direction=config.TRANSFER_DIRECTION_SEND,
+        )
+        self.assertEqual((self.download_dir / source.name).read_bytes(), data)
+
+        sender.leave_chat(self.receiver_id)
+        self.assertIsNone(sender.get_chat_peer(self.receiver_id))
+
     def test_zero_byte_file(self):
         source = self.make_source("rong.txt", b"")
 

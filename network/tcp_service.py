@@ -86,6 +86,7 @@ def _connect_and_exchange_hi(sock, address, local_peer, expected_peer_id):
         raise ValueError("The peer ID in HI does not match")
 
     sock.settimeout(None)
+    return reply
 
 
 def open_chat(address, local_peer, expected_peer_id, bus):
@@ -202,9 +203,10 @@ def receive_chat_message(sock, peer_id, bus):
 
 
 class _ChatConnection:
-    def __init__(self, sock, outgoing):
+    def __init__(self, sock, outgoing, peer_address):
         self.sock = sock
         self.outgoing = outgoing
+        self.peer_address = peer_address
         # Chỉ một luồng được ghi frame lên socket tại một thời điểm.
         self.send_lock = Lock()
 
@@ -302,8 +304,9 @@ class TCPService:
                 raise ValueError("Peer address is unavailable")
 
             address = (peer["ip"], peer["tcp_port"])
-            _connect_and_exchange_hi(sock, address, local_peer, peer_id)
-            chat = self._register_chat(peer_id, sock, outgoing=True)
+            reply = _connect_and_exchange_hi(sock, address, local_peer, peer_id)
+            peer_address = (sock.getpeername()[0], reply["tcp_port"])
+            chat = self._register_chat(peer_id, sock, peer_address, outgoing=True)
 
             if chat is None:
                 self._discard_socket(sock)
@@ -318,6 +321,14 @@ class TCPService:
             with self._lock:
                 if self._opening.get(peer_id) is sock:
                     del self._opening[peer_id]
+
+    def get_chat_peer(self, peer_id):
+        """Trả về địa chỉ lắng nghe đã biết qua một kết nối chat đang mở."""
+        chat = self._get_chat(peer_id)
+        if chat is None:
+            return None
+        ip, tcp_port = chat.peer_address
+        return {"ip": ip, "tcp_port": tcp_port}
 
     def send_message(self, peer_id, text):
         """Gửi một frame MSG qua kết nối đang dùng với peer."""
@@ -413,6 +424,7 @@ class TCPService:
             sock.settimeout(config.HI_FRAME_TIMEOUT)
             send_chat_hi(sock, local_id, local_name, local_port)
             sock.settimeout(None)
+            peer_address = (sock.getpeername()[0], greeting["tcp_port"])
         except (OSError, EOFError, ValueError) as error:
             with self._lock:
                 if sock in self._sockets:
@@ -420,7 +432,7 @@ class TCPService:
             self._discard_socket(sock)
             return
 
-        chat = self._register_chat(peer_id, sock, outgoing=False)
+        chat = self._register_chat(peer_id, sock, peer_address, outgoing=False)
         if chat is None:
             self._discard_socket(sock)
             return
@@ -436,8 +448,8 @@ class TCPService:
                 # file_service đã đóng socket, TCP chỉ cần quên nó đi.
                 self._sockets.discard(sock)
 
-    def _register_chat(self, peer_id, sock, outgoing):
-        chat = _ChatConnection(sock, outgoing)
+    def _register_chat(self, peer_id, sock, peer_address, outgoing):
+        chat = _ChatConnection(sock, outgoing, peer_address)
         with self._lock:
             if sock not in self._sockets:
                 return None

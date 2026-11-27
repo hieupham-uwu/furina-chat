@@ -1,6 +1,5 @@
 from datetime import datetime
 import os
-import threading
 import time
 import uuid
 import config
@@ -43,7 +42,7 @@ class Controller:
         self.tcp_service = None
         self.file_service = None
         self._pending_by_peer = {}
-        self._shutdown_event = threading.Event()
+        self._send_timeout_ids = set()
         self._auto_selected_latest = False
         self._last_text_send = None
 
@@ -208,11 +207,11 @@ class Controller:
 
     def _schedule_unsent_timeout(self, peer_id: str, msg_obj: dict, timeout: float):
         def _timer():
-            if self._shutdown_event.wait(timeout):
-                return
+            self._send_timeout_ids.discard(after_id)
             self._mark_unsent(peer_id, msg_obj)
 
-        threading.Thread(target=_timer, daemon=True).start()
+        after_id = self.main_window.after(round(timeout * 1000), _timer)
+        self._send_timeout_ids.add(after_id)
 
     def _dispatch_send(
         self, peer_id: str, msg_obj: dict, fn_names: tuple, args: tuple, timeout: float
@@ -703,7 +702,9 @@ class Controller:
             self.main_window.chat_panel.show_error(f"Cảnh báo: {reason}")
 
     def shutdown(self):
-        self._shutdown_event.set()
+        for after_id in self._send_timeout_ids:
+            self.main_window.after_cancel(after_id)
+        self._send_timeout_ids.clear()
         if self.file_service and hasattr(self.file_service, "stop"):
             try:
                 self.file_service.stop()
