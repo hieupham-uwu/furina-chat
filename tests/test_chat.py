@@ -216,6 +216,19 @@ class ChatTests(unittest.TestCase):
         self.wait_for_event(self.duong_bus, "chat_disconnected", self.hieu.peer_id)
         self.assertIsNone(self.duong._get_chat(self.hieu.peer_id))
 
+    def test_graceful_stop_sends_bye_to_all_connected_peers(self):
+        another, another_bus = self.start_peer(3, "An")
+        for peer, bus in ((self.hieu, self.hieu_bus), (another, another_bus)):
+            self.duong.open_chat(peer.peer_id)
+            self.wait_for_event(bus, "chat_connected", self.duong.peer_id)
+
+        self.duong.stop(graceful=True)
+
+        for peer, bus in ((self.hieu, self.hieu_bus), (another, another_bus)):
+            event = self.wait_for_event(bus, "chat_disconnected", self.duong.peer_id)
+            self.assertEqual(event.payload["reason"], "peer_left")
+            self.assertIsNone(self.duong.get_chat_peer(peer.peer_id))
+
 
 if __name__ == "__main__":
     unittest.main()

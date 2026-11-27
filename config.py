@@ -140,6 +140,9 @@ FILE_RETRY_BACKOFF: float = 0.5
 # Thời hạn tối đa để nhận trọn vẹn một frame HI (giây)
 HI_FRAME_TIMEOUT: float = 5.0
 
+# Thời gian tối đa dành cho việc gửi BYE khi thoát ứng dụng (giây)
+CHAT_SHUTDOWN_TIMEOUT: float = 0.75
+
 # Timeout khi truyền tệp mà không có tiến triển (giây)
 FILE_TRANSFER_TIMEOUT: float = 15.0
 

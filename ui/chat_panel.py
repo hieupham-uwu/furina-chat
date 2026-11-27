@@ -97,6 +97,18 @@ class ChatPanel(ctk.CTkFrame):
         self.header_bar.pack(fill="x", padx=0, pady=(0, 8))
         self.header_bar.pack_propagate(False)
 
+        self.btn_leave_chat = ctk.CTkButton(
+            self.header_bar,
+            text="Rời chat",
+            width=72,
+            corner_radius=12,
+            fg_color="#F5F3FF",
+            hover_color="#E6E0FF",
+            text_color="#453284",
+            font=("Segoe UI", 12, "bold"),
+            command=self._leave_chat,
+        )
+
         self.header_dot = ctk.CTkLabel(
             self.header_bar,
             text="●",
@@ -120,6 +132,11 @@ class ChatPanel(ctk.CTkFrame):
             text_color="#6B7280",
         )
         self.header_status_label.pack(side="left", padx=8)
+
+        self.header_address_label = ctk.CTkLabel(
+            self.header_bar, text="", font=("Segoe UI", 11), text_color="#6B7280",
+        )
+        self.header_address_label.pack(side="right", padx=(0, 8))
 
         self.messages_scroll = ctk.CTkScrollableFrame(
             self,
@@ -196,8 +213,13 @@ class ChatPanel(ctk.CTkFrame):
         )
         self.btn_send.pack(side="right")
 
-    def set_header(self, title_text: str, status: str = ""):
+    def set_header(self, title_text: str = "", status: str = "", *, ip=None, tcp_port=None):
         self.header_label.configure(text=title_text or "Chưa chọn cuộc trò chuyện")
+        self.header_address_label.configure(text=f"{ip}:{tcp_port}" if ip and tcp_port else "")
+        if title_text:
+            self.btn_leave_chat.pack(side="right", padx=(0, 10), before=self.header_dot)
+        else:
+            self.btn_leave_chat.pack_forget()
         st = (status or "").lower()
         if st == "away":
             self.header_dot.configure(text_color="#EAB308")
@@ -208,9 +230,16 @@ class ChatPanel(ctk.CTkFrame):
         elif st == "offline":
             self.header_dot.configure(text_color="#9CA3AF")
             self.header_status_label.configure(text="(Offline)", text_color="#6B7280")
+        elif st == "unknown":
+            self.header_dot.configure(text_color="#9CA3AF")
+            self.header_status_label.configure(text="(Chưa nhận HELLO)", text_color="#6B7280")
         else:
             self.header_dot.configure(text_color="#6B7280")
             self.header_status_label.configure(text="", text_color="#6B7280")
+
+    def _leave_chat(self):
+        if self.controller:
+            self.controller.leave_active_chat()
 
     def show_error(self, message: str):
         msg = str(message or "Đã xảy ra lỗi.")
@@ -257,8 +286,6 @@ class ChatPanel(ctk.CTkFrame):
                 entry.delete(*selection)
                 entry.mark_set("insert", selection[0])
             entry.insert("insert", pasted[:available])
-            if self.controller:
-                self.controller.record_user_activity(auto_back_online=True)
         if len(pasted) > available:
             self.show_error(f"Ô nhập chỉ chứa tối đa {MAX_MSG_CHARS} ký tự.")
         return "break"

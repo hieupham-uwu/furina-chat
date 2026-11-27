@@ -68,6 +68,7 @@ class MainWindow(ctk.CTk):
             on_select_peer_cb=self._on_select_peer,
             on_change_name_cb=self._on_change_name,
             on_toggle_activity_cb=self._on_toggle_activity,
+            on_quit_cb=self._on_close,
             width=275,
         )
         self.sidebar.set_my_name(current_name)
@@ -80,8 +81,6 @@ class MainWindow(ctk.CTk):
             on_toggle_sticker_cb=self._on_toggle_sticker_popup,
         )
         self.chat_panel.grid(row=0, column=1, sticky="nsew", padx=(0, 14), pady=14)
-
-        self.bind_all("<KeyPress>", self._on_user_input_event, add="+")
 
         self._poll_after_id = self.after(50, self._poll_event_bus)
 
@@ -98,10 +97,6 @@ class MainWindow(ctk.CTk):
             self._next_ui_collection = None
             gc.collect()
             gc.enable()
-
-    def _on_user_input_event(self, _event):
-        if self.controller:
-            self.controller.record_user_activity(auto_back_online=True)
 
     def _on_toggle_sticker_popup(self, anchor_widget=None):
         if self._picker_win is not None and self._picker_win.winfo_exists():
@@ -164,7 +159,7 @@ class MainWindow(ctk.CTk):
             peers = {str(k): dict(v) for k, v in self.app_state.peers.items()}
             unread = {str(k): v for k, v in self.app_state.unread_counts.items()}
             last_act = {str(k): v for k, v in self.app_state.last_activity.items()}
-            connected_ids = {
+            history_ids = {
                 str(pid)
                 for pid, msgs in self.app_state.chat_history.items()
                 if len(msgs) > 0
@@ -178,7 +173,7 @@ class MainWindow(ctk.CTk):
             unread,
             active_id,
             last_activity=last_act,
-            connected_ids=connected_ids,
+            history_ids=history_ids,
         )
 
     def safe_update_status(self, peer_id: str, msg_id: str, status_text: str):
@@ -215,9 +210,6 @@ class MainWindow(ctk.CTk):
         if self._next_ui_collection is not None and time.monotonic() >= self._next_ui_collection:
             gc.collect()
             self._next_ui_collection = time.monotonic() + 2
-
-        if self.controller:
-            self.controller.check_idle_away()
 
         for _ in range(100):
             ev = self._next_bus_event()

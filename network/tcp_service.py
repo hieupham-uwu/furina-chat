@@ -257,24 +257,49 @@ class TCPService:
             self._listener_thread.start()
             return self.tcp_port
 
-    def stop(self):
-        """Dừng listener và đóng các socket của dịch vụ."""
+    def stop(self, *, graceful=False):
+        """Dừng listener và đóng socket, có thể báo BYE cho phiên chat đang mở."""
         with self._lock:
             listener = self._listener
             listener_thread = self._listener_thread
             sockets = list(self._sockets)
+            chats = list(self._chats.values()) if graceful else []
             self._listener = None
             self._listener_thread = None
             self._chats.clear()
             self._opening.clear()
+            # Chuyển quyền đóng các socket cho stop(), kể cả khi luồng đọc vừa thoát.
             self._sockets.clear()
 
         if listener is not None:
             listener.close()
+        self._send_shutdown_byes(chats)
         for sock in sockets:
             self._close_socket(sock)
         if listener_thread is not None:
             listener_thread.join()
+
+    @staticmethod
+    def _send_shutdown_byes(chats):
+        deadline = time.monotonic() + config.CHAT_SHUTDOWN_TIMEOUT
+        for chat in chats:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if not chat.send_lock.acquire(timeout=min(0.1, remaining)):
+                continue
+            try:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                chat.sock.settimeout(min(0.15, remaining))
+                send_packet(chat.sock, {"type": config.TYPE_BYE, "payload_size": 0})
+                chat.sock.shutdown(socket.SHUT_WR)
+            except OSError:
+                # Một peer mất mạng không ngăn thoát app hoặc gửi BYE cho các peer khác.
+                pass
+            finally:
+                chat.send_lock.release()
 
     def open_chat(self, peer_id):
         """Giữ kết nối hiện có hoặc mở TCP tới địa chỉ do discovery cung cấp."""

@@ -1,6 +1,5 @@
 import socket
 import threading
-import time
 import uuid
 from typing import Any, Dict, List, Optional
 import config
@@ -24,7 +23,6 @@ class AppState:
         )
         self.my_status: str = getattr(config, "STATUS_ONLINE", "online")
         self.my_tcp_port: int = getattr(config, "DEFAULT_TCP_PORT", 5000)
-        self.last_user_action_ts: float = time.time()
 
         self.peers: Dict[str, Dict[str, Any]] = {}
         self.chat_history: Dict[str, List[Dict[str, Any]]] = {}
