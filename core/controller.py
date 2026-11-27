@@ -45,6 +45,7 @@ class Controller:
         self._pending_by_peer = {}
         self._shutdown_event = threading.Event()
         self._auto_selected_latest = False
+        self._last_text_send = None
 
     def bind_services(self, udp_service, tcp_service, file_service):
         self.udp_service = udp_service
@@ -241,10 +242,20 @@ class Controller:
             )
             return
 
+        now_ts = time.time()
         with self.state.lock:
             active_id = self.state.active_peer_id
             my_id = self.state.my_peer_id
             my_name = self.state.my_name
+            last_send = getattr(self, "_last_text_send", None)
+            if (
+                last_send
+                and last_send[0] == active_id
+                and last_send[1] == text
+                and (now_ts - last_send[2]) < 0.5
+            ):
+                return
+            self._last_text_send = (active_id, text, now_ts)
 
         if not active_id:
             return

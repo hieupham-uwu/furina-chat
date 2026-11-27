@@ -3,7 +3,7 @@ import platform
 import subprocess
 from tkinter import filedialog
 import customtkinter as ctk
-from PIL import Image
+from PIL import Image, ImageDraw
 import config
 from ui.sticker_picker import _get_stickers_dir
 
@@ -25,6 +25,14 @@ def _get_downloads_dir() -> str:
     return os.path.join(base_dir, dir_name)
 
 
+def _get_assets_dir() -> str:
+    val = getattr(config, "ASSETS_DIR", None)
+    if val:
+        return str(val)
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_dir, "assets")
+
+
 def _open_local_path(path: str) -> bool:
     if not path or not os.path.exists(path):
         return False
@@ -41,14 +49,53 @@ def _open_local_path(path: str) -> bool:
         return False
 
 
+def _make_avatar_pil(
+    avatar_source=None, sender_name: str = "Me", size: int = 26
+) -> Image.Image:
+    if isinstance(avatar_source, Image.Image):
+        return avatar_source.convert("RGBA").resize((size, size))
+    if isinstance(avatar_source, str) and os.path.isfile(avatar_source):
+        try:
+            with Image.open(avatar_source) as im:
+                return im.convert("RGBA").resize((size, size))
+        except Exception:
+            pass
+
+    assets_dir = _get_assets_dir()
+    for fname in ("my_avatar.png", "my_avatar.jpg", "avatar.png", "avatar.jpg"):
+        cand = os.path.join(assets_dir, fname)
+        if os.path.isfile(cand):
+            try:
+                with Image.open(cand) as im:
+                    return im.convert("RGBA").resize((size, size))
+            except Exception:
+                pass
+
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.ellipse([0, 0, size - 1, size - 1], fill=(106, 73, 250, 255))
+    letter = (sender_name or "M").strip()[:1].upper() or "M"
+    draw.text((size // 2 - 3, size // 2 - 6), letter, fill=(255, 255, 255, 255))
+    return img
+
+
 class ChatPanel(ctk.CTkFrame):
-    def __init__(self, master, controller, on_toggle_sticker_cb=None, **kwargs):
+    def __init__(
+        self,
+        master,
+        controller,
+        on_toggle_sticker_cb=None,
+        my_avatar=None,
+        **kwargs,
+    ):
         kwargs.setdefault("fg_color", "transparent")
         super().__init__(master, **kwargs)
         self.controller = controller
         self.on_toggle_sticker_cb = on_toggle_sticker_cb
+        self.my_avatar = my_avatar
         self._image_cache = []
         self._status_labels = {}
+        self._sending_text = False
 
         self.header_bar = ctk.CTkFrame(
             self, fg_color="#FFFFFF", corner_radius=14, height=42
@@ -79,6 +126,20 @@ class ChatPanel(ctk.CTkFrame):
             text_color="#6B7280",
         )
         self.header_status_label.pack(side="left", padx=8)
+
+        self.btn_change_avatar = ctk.CTkButton(
+            self.header_bar,
+            text="Đổi AVT",
+            width=72,
+            height=28,
+            corner_radius=10,
+            fg_color="#EDE9FE",
+            hover_color="#DDD6FE",
+            text_color="#453284",
+            font=("Segoe UI", 11, "bold"),
+            command=self._choose_avatar,
+        )
+        self.btn_change_avatar.pack(side="right", padx=(4, 10))
 
         self.messages_scroll = ctk.CTkScrollableFrame(
             self,
@@ -197,6 +258,22 @@ class ChatPanel(ctk.CTkFrame):
         )
         self.btn_send.pack(side="right")
 
+    def _choose_avatar(self):
+        file_path = filedialog.askopenfilename(
+            title="Chọn ảnh đại diện của bạn",
+            filetypes=[("Tệp hình ảnh", "*.png *.jpg *.jpeg *.gif *.webp")],
+        )
+        if file_path:
+            self.set_my_avatar(file_path)
+
+    def set_my_avatar(self, avatar_source):
+        self.my_avatar = avatar_source
+        if self.controller and self.controller.has_active_peer():
+            with self.controller.state.lock:
+                pid = self.controller.state.active_peer_id
+                history = list(self.controller.state.chat_history.get(pid, []))
+            self.render_messages(history)
+
     def set_header(self, title_text: str, status: str = ""):
         self.header_label.configure(text=title_text or "Chưa chọn cuộc trò chuyện")
         st = (status or "").lower()
@@ -240,6 +317,8 @@ class ChatPanel(ctk.CTkFrame):
         return "break"
 
     def _send_text(self):
+        if getattr(self, "_sending_text", False):
+            return
         raw_text = self.entry_msg.get()
         if len(raw_text) > MAX_MSG_CHARS:
             self.show_error(
@@ -253,10 +332,14 @@ class ChatPanel(ctk.CTkFrame):
             self.show_error("Hãy chọn một người để chat.")
             return
 
-        self.hide_error()
-        self.entry_msg.delete(0, "end")
-        self.entry_msg.focus_set()
-        self.controller.send_text_message(text)
+        self._sending_text = True
+        try:
+            self.hide_error()
+            self.entry_msg.delete(0, "end")
+            self.entry_msg.focus_set()
+            self.controller.send_text_message(text)
+        finally:
+            self.after(150, lambda: setattr(self, "_sending_text", False))
 
     def _on_sticker_button_click(self):
         if not (self.controller and self.controller.has_active_peer()):
@@ -358,8 +441,11 @@ class ChatPanel(ctk.CTkFrame):
             return
 
         anchor = "e" if is_me else "w"
-        row_container = ctk.CTkFrame(self.messages_scroll, fg_color="transparent")
-        row_container.pack(anchor=anchor, pady=4, padx=12, fill="none")
+        row_outer = ctk.CTkFrame(self.messages_scroll, fg_color="transparent")
+        row_outer.pack(anchor=anchor, pady=4, padx=12, fill="none")
+
+        row_container = ctk.CTkFrame(row_outer, fg_color="transparent")
+        row_container.pack(side="left", anchor=anchor)
 
         time_str = msg.get("timestamp", "")
         header_txt = f"{sender_name} • {time_str}" if time_str else sender_name
@@ -506,6 +592,18 @@ class ChatPanel(ctk.CTkFrame):
         lbl_status.pack(anchor=anchor, padx=4, pady=(1, 0))
         if msg_id:
             self._status_labels[msg_id] = lbl_status
+
+        if is_me:
+            av_src = msg.get("avatar") or self.my_avatar
+            av_pil = _make_avatar_pil(av_src, sender_name=sender_name, size=26)
+            av_img = ctk.CTkImage(light_image=av_pil, dark_image=av_pil, size=(26, 26))
+            self._image_cache.append(av_img)
+            ctk.CTkLabel(
+                row_outer,
+                image=av_img,
+                text="",
+                fg_color="transparent",
+            ).pack(side="right", anchor="s", padx=(6, 0), pady=(0, 14))
 
         self._scroll_to_bottom()
 

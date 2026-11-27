@@ -11,7 +11,7 @@ from core.controller import Controller
 from core.state import AppState
 from ui.chat_panel import ChatPanel
 from ui.peer_sidebar import PeerSidebar
-from ui.sticker_picker import StickerPopup
+from ui.sticker_picker import StickerPicker
 
 
 class MainWindow(ctk.CTk):
@@ -31,6 +31,7 @@ class MainWindow(ctk.CTk):
 
         self._poll_after_id = None
         self._closing = False
+        self._picker_win = None
 
         try:
             self._windows_set_titlebar_color = lambda *_args, **_kwargs: None
@@ -75,12 +76,7 @@ class MainWindow(ctk.CTk):
         )
         self.chat_panel.grid(row=0, column=1, sticky="nsew", padx=(0, 14), pady=14)
 
-        self.sticker_popup = StickerPopup(
-            self, on_select_sticker_cb=self._on_sticker_chosen
-        )
-
         self.bind_all("<KeyPress>", self._on_user_input_event, add="+")
-        self.bind_all("<ButtonPress>", self._on_global_click, add="+")
 
         self._poll_after_id = self.after(50, self._poll_event_bus)
 
@@ -88,44 +84,32 @@ class MainWindow(ctk.CTk):
         if self.controller:
             self.controller.record_user_activity(auto_back_online=True)
 
-    @staticmethod
-    def _point_in_widget(widget, x_root: int, y_root: int) -> bool:
-        try:
-            if widget is None or not widget.winfo_exists() or not widget.winfo_ismapped():
-                return False
-            x1 = widget.winfo_rootx()
-            y1 = widget.winfo_rooty()
-            x2 = x1 + widget.winfo_width()
-            y2 = y1 + widget.winfo_height()
-            return x1 <= x_root <= x2 and y1 <= y_root <= y2
-        except Exception:
-            return False
-
-    def _on_global_click(self, event):
-        if self.controller:
-            self.controller.record_user_activity(auto_back_online=True)
-        if not (hasattr(self, "sticker_popup") and self.sticker_popup.winfo_ismapped()):
-            return
-        xr = getattr(event, "x_root", None)
-        yr = getattr(event, "y_root", None)
-        if xr is None or yr is None:
-            return
-        if self._point_in_widget(self.sticker_popup, xr, yr):
-            return
-        if self._point_in_widget(self.chat_panel.btn_sticker, xr, yr):
-            return
-        self.sticker_popup.hide_popup()
-
     def _on_toggle_sticker_popup(self, anchor_widget=None):
-        if hasattr(self, "sticker_popup"):
-            target = anchor_widget or getattr(self.chat_panel, "btn_sticker", None)
-            self.sticker_popup.toggle_above_widget(target)
+        if self._picker_win is not None and self._picker_win.winfo_exists():
+            try:
+                self._picker_win.destroy()
+            except Exception:
+                pass
+            self._picker_win = None
+            return
+
+        target = anchor_widget or getattr(self.chat_panel, "btn_sticker", None)
+        self._picker_win = StickerPicker(
+            self,
+            on_sticker_selected=self._on_sticker_chosen,
+            anchor_widget=target,
+        )
 
     def hide_sticker_popup(self):
-        if hasattr(self, "sticker_popup"):
-            self.sticker_popup.hide_popup()
+        if self._picker_win is not None and self._picker_win.winfo_exists():
+            try:
+                self._picker_win.destroy()
+            except Exception:
+                pass
+        self._picker_win = None
 
     def _on_sticker_chosen(self, pack: str, sticker_id: str):
+        self._picker_win = None
         if self.controller and self.controller.has_active_peer():
             self.chat_panel.hide_error()
             self.chat_panel.entry_msg.focus_set()
