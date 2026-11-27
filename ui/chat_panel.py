@@ -7,7 +7,7 @@ from PIL import Image
 import config
 from ui.sticker_picker import StickerPopup, _get_stickers_dir
 
-MAX_MSG_CHARS = getattr(config, "MAX_MSG_CHARS", 4000)
+MAX_MSG_CHARS = config.MAX_MESSAGE_LENGTH
 
 
 def _get_downloads_dir() -> str:

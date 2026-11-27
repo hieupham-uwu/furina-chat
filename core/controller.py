@@ -1,26 +1,31 @@
+from collections import deque
 from datetime import datetime
 import os
 import threading
 import time
 import uuid
-from core.state import state
+
+import config
 
 # Sau khoảng thời gian này mà chưa gửi/xác nhận được do lỗi mạng thì mới hiện "Chưa gửi được"
 SEND_ACK_TIMEOUT = 5.0
 FILE_ACK_TIMEOUT = 15.0
 
 # Chờ tối đa để kết nối chat sẵn sàng trước khi gửi (chạy ở thread nền).
-CHAT_READY_TIMEOUT = 4.0
+CHAT_READY_TIMEOUT = config.HI_FRAME_TIMEOUT + 0.5
 
 
 class Controller:
     def __init__(self, main_window, standalone_demo: bool = True):
         self.main_window = main_window
+        self.state = main_window.app_state
         self.standalone_demo = standalone_demo
         self.udp_service = None
         self.tcp_service = None
         self.file_service = None
-        self._pending_by_peer = {}  # {peer_id: [msg_obj, ...]}
+        self._outbox = {}
+        self._outbox_lock = threading.Lock()
+        self._closing = threading.Event()
 
     def bind_services(self, udp_service, tcp_service, file_service):
         self.udp_service = udp_service
@@ -28,10 +33,11 @@ class Controller:
         self.file_service = file_service
 
     def has_active_peer(self) -> bool:
-        with state.lock:
-            return state.active_peer_id is not None
+        with self.state.lock:
+            return self.state.active_peer_id is not None
 
     def select_peer(self, new_peer_id: str):
+        state = self.state
         current_input = self.main_window.chat_panel.get_current_input()
         self.main_window.chat_panel.sticker_popup.hide_popup()
 
@@ -47,9 +53,12 @@ class Controller:
             peer_status = peer_info.get("status", "offline")
 
             history = list(state.chat_history.get(new_peer_id, []))
-            for m in history:
-                if m.get("is_me") and m.get("delivery_status") in ("Đã gửi", "Đã nhận"):
-                    m["delivery_status"] = "Đã xem"
+            if self.standalone_demo:
+                for message in history:
+                    if message.get("is_me") and message.get("delivery_status") in (
+                        "Đã gửi", "Đã nhận"
+                    ):
+                        message["delivery_status"] = "Đã xem"
 
         # Mở chat ở thread nền: connect tới peer offline có thể chờ tới 5 giây,
         # không được làm đứng giao diện.
@@ -71,65 +80,49 @@ class Controller:
         except Exception:
             pass
 
-    def _has_chat(self, peer_id: str) -> bool:
-        svc = self.tcp_service
-        if svc is None:
-            return False
-        checker = getattr(svc, "has_chat", None)
-        if callable(checker):
-            return bool(checker(peer_id))
-        getter = getattr(svc, "_get_chat", None)
-        return bool(getter and getter(peer_id))
+    def _deliver(self, peer_id, message, send, *args):
+        """Gửi theo thứ tự cho từng peer, kể cả khi đang mở kết nối."""
+        with self._outbox_lock:
+            if peer_id in self._outbox:
+                self._outbox[peer_id].append((message, send, args))
+                return
+            self._outbox[peer_id] = deque([(message, send, args)])
 
-    def _send_now(self, kind: str, peer_id: str, *args):
-        svc = self.tcp_service
-        if svc is None:
-            return
-        try:
-            if kind == "message":
-                svc.send_message(peer_id, *args)
-            elif kind == "sticker":
-                svc.send_sticker(peer_id, *args)
-        except Exception:
-            pass
+        threading.Thread(
+            target=self._drain_outbox, args=(peer_id,), daemon=True
+        ).start()
 
-    def _deliver(self, kind: str, peer_id: str, *args):
-        """Gửi ngay nếu chat đã mở; nếu chưa thì chờ/mở ở thread nền để UI không đứng."""
-        if self.tcp_service is None:
-            return
-
-        try:
-            ready = self._has_chat(peer_id)
-        except Exception:
-            ready = False
-
-        if ready:
-            self._send_now(kind, peer_id, *args)
-            return
-
-        def _wait_then_send():
-            deadline = time.monotonic() + CHAT_READY_TIMEOUT
-            attempted_open = False
-            while time.monotonic() < deadline:
-                try:
-                    if self._has_chat(peer_id):
-                        self._send_now(kind, peer_id, *args)
-                        return
-                except Exception:
+    def _drain_outbox(self, peer_id):
+        while True:
+            with self._outbox_lock:
+                pending = self._outbox[peer_id]
+                if not pending or self._closing.is_set():
+                    del self._outbox[peer_id]
                     return
-                if not attempted_open:
-                    attempted_open = True
-                    try:
-                        self.tcp_service.open_chat(peer_id)
-                    except Exception:
-                        pass
-                else:
-                    time.sleep(0.05)
-            # Hết thời gian: bộ hẹn giờ sẽ hiển thị "Chưa gửi được".
+                message, send, args = pending.popleft()
 
-        threading.Thread(target=_wait_then_send, daemon=True).start()
+            sent = self._send_when_connected(peer_id, send, args)
+            label = "Đã gửi" if sent else "Chưa gửi được"
+            with self.state.lock:
+                message["acked"] = sent
+                message["delivery_status"] = label
+            self.main_window.safe_update_status(peer_id, message["msg_id"], label)
+
+    def _send_when_connected(self, peer_id, send, args):
+        tcp = self.tcp_service
+        if not tcp.has_chat(peer_id):
+            deadline = time.monotonic() + CHAT_READY_TIMEOUT
+            self._open_chat_async(peer_id)
+            while not tcp.has_chat(peer_id) and time.monotonic() < deadline:
+                if self._closing.wait(0.05):
+                    return False
+
+        if self._closing.is_set() or not tcp.has_chat(peer_id):
+            return False
+        return send(peer_id, *args)
 
     def change_status(self, new_status: str):
+        state = self.state
         with state.lock:
             state.my_status = new_status
         if self.udp_service and hasattr(self.udp_service, "set_status"):
@@ -179,8 +172,9 @@ class Controller:
         threading.Thread(target=_worker, daemon=True).start()
 
     def send_text_message(self, text: str):
-        if len(text) > 4000:
-            text = text[:4000]
+        state = self.state
+        if len(text) > config.MAX_MESSAGE_LENGTH:
+            text = text[:config.MAX_MESSAGE_LENGTH]
 
         with state.lock:
             active_id = state.active_peer_id
@@ -207,17 +201,16 @@ class Controller:
         with state.lock:
             state.chat_history.setdefault(active_id, []).append(msg_obj)
             state.drafts[active_id] = ""
-        self._pending_by_peer.setdefault(active_id, []).append(msg_obj)
-
         self.main_window.chat_panel.append_single_message(msg_obj)
-        self._schedule_unsent_timeout(active_id, msg_obj, SEND_ACK_TIMEOUT)
-
-        if self.tcp_service and hasattr(self.tcp_service, "send_message"):
-            self._deliver("message", active_id, text)
+        if self.tcp_service is not None:
+            self._deliver(active_id, msg_obj, self.tcp_service.send_message, text)
         elif self.standalone_demo:
-            self._simulate_local_send(active_id, msg_obj, is_file=False)
+            self._simulate_local_send(active_id, msg_obj)
+        else:
+            self._schedule_unsent_timeout(active_id, msg_obj, SEND_ACK_TIMEOUT)
 
     def send_sticker(self, pack: str, sticker_id: str):
+        state = self.state
         with state.lock:
             active_id = state.active_peer_id
             my_id = state.my_peer_id
@@ -243,17 +236,16 @@ class Controller:
 
         with state.lock:
             state.chat_history.setdefault(active_id, []).append(msg_obj)
-        self._pending_by_peer.setdefault(active_id, []).append(msg_obj)
-
         self.main_window.chat_panel.append_single_message(msg_obj)
-        self._schedule_unsent_timeout(active_id, msg_obj, SEND_ACK_TIMEOUT)
-
-        if self.tcp_service and hasattr(self.tcp_service, "send_sticker"):
-            self._deliver("sticker", active_id, pack, sticker_id)
+        if self.tcp_service is not None:
+            self._deliver(active_id, msg_obj, self.tcp_service.send_sticker, pack, sticker_id)
         elif self.standalone_demo:
-            self._simulate_local_send(active_id, msg_obj, is_file=False)
+            self._simulate_local_send(active_id, msg_obj)
+        else:
+            self._schedule_unsent_timeout(active_id, msg_obj, SEND_ACK_TIMEOUT)
 
     def send_file(self, file_path: str, media_type: str = "FILE"):
+        state = self.state
         if not file_path or not os.path.isfile(file_path):
             self.main_window.chat_panel.show_error("File not found: tệp không tồn tại.")
             return
@@ -269,7 +261,11 @@ class Controller:
         norm_type = "IMAGE" if str(media_type).upper() == "IMAGE" else "FILE"
         msg_id = str(uuid.uuid4())
         fname = os.path.basename(file_path)
-        fsize = os.path.getsize(file_path)
+        try:
+            fsize = os.path.getsize(file_path)
+        except OSError as error:
+            self.main_window.chat_panel.show_error(str(error))
+            return
         now_str = datetime.now().strftime("%H:%M")
 
         msg_obj = {
@@ -289,10 +285,7 @@ class Controller:
 
         with state.lock:
             state.chat_history.setdefault(active_id, []).append(msg_obj)
-        self._pending_by_peer.setdefault(active_id, []).append(msg_obj)
-
         self.main_window.chat_panel.append_single_message(msg_obj)
-        self._schedule_unsent_timeout(active_id, msg_obj, FILE_ACK_TIMEOUT)
 
         if self.file_service and hasattr(self.file_service, "send_file"):
             try:
@@ -308,12 +301,19 @@ class Controller:
                             "bytes_done": 0,
                             "msg_obj": msg_obj,
                         }
-            except Exception:
-                self._schedule_unsent_timeout(active_id, msg_obj, FILE_ACK_TIMEOUT)
+            except (OSError, RuntimeError, ValueError) as error:
+                msg_obj["delivery_status"] = "Chưa gửi được"
+                self.main_window.chat_panel.update_message_status(
+                    msg_id, msg_obj["delivery_status"]
+                )
+                self.main_window.chat_panel.show_error(str(error))
         elif self.standalone_demo:
             self._simulate_local_send(active_id, msg_obj, is_file=True)
+        else:
+            self._schedule_unsent_timeout(active_id, msg_obj, FILE_ACK_TIMEOUT)
 
     def leave_chat(self):
+        state = self.state
         with state.lock:
             active_id = state.active_peer_id
             if not active_id:
@@ -332,6 +332,7 @@ class Controller:
         self.main_window.refresh_sidebar()
 
     def process_event(self, event: dict):
+        state = self.state
         etype = event.get("type")
         data = event.get("data") if isinstance(event.get("data"), dict) else event
 
@@ -355,15 +356,6 @@ class Controller:
                     state.peers[pid]["status"] = "offline"
             self.main_window.refresh_sidebar()
 
-        elif etype == "chat_connected":
-            pid = data.get("peer_id")
-            if not pid:
-                return
-            with state.lock:
-                if pid in state.peers:
-                    state.peers[pid]["status"] = "online"
-            self.main_window.refresh_sidebar()
-
         elif etype == "chat_disconnected":
             pid = data.get("peer_id")
             if not pid:
@@ -376,16 +368,6 @@ class Controller:
                 self.main_window.chat_panel.show_error(
                     f"Mất kết nối chat với {name} ({reason}). Gửi tin mới để kết nối lại."
                 )
-
-        elif etype in ("message_sent", "sticker_sent"):
-            pid = data.get("peer_id")
-            pending = self._pending_by_peer.get(pid, [])
-            for m in reversed(pending):
-                if not m.get("acked"):
-                    m["acked"] = True
-                    m["delivery_status"] = "Đã gửi"
-                    self.main_window.safe_update_status(pid, m["msg_id"], "Đã gửi")
-                    break
 
         elif etype in ("message_received", "sticker_received"):
             # Dù peer đang hiển thị là offline trên discovery, vẫn nhận và hiển thị/lưu tin nhắn bình thường
@@ -542,6 +524,7 @@ class Controller:
             self.main_window.chat_panel.show_error(reason)
 
     def shutdown(self):
+        self._closing.set()
         # Dừng file trước TCP để các phiên truyền đang dở được đóng gọn.
         for svc in (self.file_service, self.tcp_service, self.udp_service):
             if svc and hasattr(svc, "stop"):

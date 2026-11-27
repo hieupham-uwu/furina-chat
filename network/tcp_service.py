@@ -332,32 +332,34 @@ class TCPService:
         """Cho Controller biết đã có kết nối chat sẵn sàng để gửi hay chưa."""
         return self._get_chat(peer_id) is not None
 
-    def send_message(self, peer_id, text):
-        """Gửi một frame MSG qua kết nối đang dùng với peer."""
-        self._send_on_chat(peer_id, "send_message", send_chat_message, text)
+    def send_message(self, peer_id, text) -> bool:
+        """Gửi MSG và trả về kết quả ghi frame vào kết nối."""
+        return self._send_on_chat(peer_id, "send_message", send_chat_message, text)
 
-    def send_sticker(self, peer_id, pack, sticker_id):
-        """Gửi mã sticker qua kết nối chat để bên nhận tra ảnh cục bộ."""
-        self._send_on_chat(peer_id, "send_sticker", _send_chat_sticker, pack, sticker_id)
+    def send_sticker(self, peer_id, pack, sticker_id) -> bool:
+        """Gửi mã sticker và trả về kết quả ghi frame vào kết nối."""
+        return self._send_on_chat(peer_id, "send_sticker", _send_chat_sticker, pack, sticker_id)
 
     def _send_on_chat(self, peer_id, operation, send_frame, *fields):
         chat = self._get_chat(peer_id)
         if chat is None:
             self._failed(operation, peer_id, "Chat is not connected")
-            return
+            return False
 
         # MSG và STICKER dùng cùng khóa gửi với BYE.
         with chat.send_lock:
             if self._get_chat(peer_id) is not chat:
                 self._failed(operation, peer_id, "Chat connection changed")
-                return
+                return False
             try:
                 send_frame(chat.sock, peer_id, *fields, bus=self._bus)
+                return True
             except ValueError as error:
                 self._failed(operation, peer_id, error)
             except OSError as error:
                 self._failed(operation, peer_id, error)
                 self._disconnect(peer_id, chat, str(error))
+        return False
 
     def leave_chat(self, peer_id):
         """Gửi BYE trước khi đóng kết nối chat."""

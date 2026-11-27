@@ -1,4 +1,8 @@
-"""Chạy thử UDP discovery + TCP chat mà không cần giao diện.
+"""Chạy Furina Chat trên mạng LAN.
+
+Dùng giao diện: python main.py --gui --name Quan
+
+Chế độ console dùng để kiểm tra UDP discovery và TCP chat.
 
 Mở 2 terminal (cùng máy hoặc cùng LAN):
     python main.py --name Quan
@@ -155,8 +159,51 @@ def resolve_peer(state, target):
     return None
 
 
+def run_gui(name, port):
+    from tkinter import messagebox
+
+    from core.state import AppState
+    from network import file_service
+    from ui.main_window import MainWindow
+
+    state = AppState()
+    bus = EventBus()
+    window = MainWindow(
+        state=state, event_bus=bus, my_name=name, enable_local_preview=False
+    )
+    udp = None
+
+    def get_peer(peer_id):
+        return udp.get_peer(peer_id) if udp is not None else None
+
+    tcp = TCPService(state.my_peer_id, name, get_peer, bus, port=port)
+    window.controller.bind_services(None, tcp, None)
+    try:
+        try:
+            state.my_tcp_port = tcp.start()
+            udp = UDPService(state.my_peer_id, name, state.my_tcp_port, bus)
+            window.controller.bind_services(udp, tcp, file_service)
+            file_service.configure(
+                state.my_peer_id, name, state.my_tcp_port, get_peer, bus
+            )
+            udp.start()
+        except OSError as error:
+            messagebox.showerror(
+                "Furina Chat",
+                f"Không khởi động được mạng LAN.\n{error}",
+                parent=window,
+            )
+            return 1
+
+        window.mainloop()
+    finally:
+        window._on_close()
+    return 0
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Chạy thử UDP discovery + TCP chat")
+    parser = argparse.ArgumentParser(description="Furina Chat trên mạng LAN")
+    parser.add_argument("--gui", action="store_true", help="mở giao diện chat LAN")
     parser.add_argument(
         "--name",
         default=f"User-{uuid.uuid4().hex[:4]}",
@@ -169,6 +216,13 @@ def main():
         help="cổng TCP (0 = hệ điều hành tự cấp)",
     )
     args = parser.parse_args()
+    args.name = args.name.strip()
+    if not args.name:
+        parser.error("--name không được để trống")
+    if not 0 <= args.tcp_port <= 65535:
+        parser.error("--tcp-port phải nằm trong khoảng 0 đến 65535")
+    if args.gui:
+        return run_gui(args.name, args.tcp_port)
 
     # peer_id tạo một lần, dùng chung cho HELLO (UDP) và HI (TCP)
     peer_id = str(uuid.uuid4())

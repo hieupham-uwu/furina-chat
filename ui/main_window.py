@@ -26,7 +26,7 @@ class MainWindow(ctk.CTk):
         enable_local_preview: bool = True,
     ):
         super().__init__()
-        self.title("Furina Chat")
+        self.title("Furina Chat" if enable_local_preview else f"Furina Chat - {my_name}")
         self.geometry("1040x680")
         self.minsize(780, 520)
         self.configure(fg_color="#F5F3FF")
@@ -249,6 +249,8 @@ class MainWindow(ctk.CTk):
         self._post_ui(_push)
 
     def _on_close(self):
+        if self._closing:
+            return
         self._closing = True
         if self._poll_after_id is not None:
             try:
