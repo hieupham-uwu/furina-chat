@@ -162,6 +162,22 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(received.name, "message_received")
         self.assertEqual(received.payload["text"], "Chat vẫn hoạt động")
 
+    def test_unicode_message_at_limit_then_next_message(self):
+        self.duong.open_chat(self.hieu.peer_id)
+        connected = self.wait_for_event(self.hieu_bus, "chat_connected", self.duong.peer_id)
+        self.assertEqual(connected.payload["name"], self.duong.peer_name)
+        self.assertEqual(connected.payload["tcp_port"], self.duong.tcp_port)
+
+        text = ("ế🙂" * config.MAX_MESSAGE_LENGTH)[:config.MAX_MESSAGE_LENGTH]
+        self.assertTrue(self.duong.send_message(self.hieu.peer_id, text))
+        received = self.wait_for_event(self.hieu_bus, "message_received", self.duong.peer_id)
+        self.assertEqual(received.payload["text"], text)
+
+        self.assertFalse(self.duong.send_message(self.hieu.peer_id, text + "x"))
+        self.assertTrue(self.duong.send_message(self.hieu.peer_id, "Tin tiếp theo"))
+        received = self.wait_for_event(self.hieu_bus, "message_received", self.duong.peer_id)
+        self.assertEqual(received.payload["text"], "Tin tiếp theo")
+
     def test_invalid_received_sticker_closes_chat_without_sticker_event(self):
         self.duong.open_chat(self.hieu.peer_id)
         self.wait_for_event(self.hieu_bus, "chat_connected", self.duong.peer_id)

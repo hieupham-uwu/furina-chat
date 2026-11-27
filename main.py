@@ -9,7 +9,6 @@ if _ROOT_DIR not in sys.path:
     sys.path.insert(0, _ROOT_DIR)
 
 import config
-from core.controller import Controller
 from core.event_bus import EventBus
 from core.state import AppState
 from network import file_service
@@ -54,6 +53,8 @@ def main():
         help="Địa chỉ IPv4 nhận gói tìm máy, ví dụ địa chỉ broadcast của mạng Wi-Fi",
     )
     args = parser.parse_args()
+    if not 0 <= args.port <= 65535:
+        parser.error("--port phải nằm trong khoảng 0 đến 65535")
 
     display_name = _resolve_display_name(args.name)
     bus = EventBus()
@@ -70,31 +71,33 @@ def main():
         my_name=display_name,
         my_status=my_status,
     )
-    controller = Controller(app, app_state=app_state, event_bus=bus)
-    app.set_controller(controller)
 
-    udp_service = UDPService(
-        peer_id=my_id,
-        peer_name=display_name,
-        tcp_port=args.port,
-        event_bus=bus,
-        discovery_ip=str(args.discovery_ip) if args.discovery_ip is not None else None,
-    )
+    udp_service = None
+
+    def get_discovered_peer(peer_id):
+        return udp_service.get_peer(peer_id) if udp_service is not None else None
+
     tcp_service = TCPService(
         peer_id=my_id,
         peer_name=display_name,
-        get_peer=udp_service.get_peer,
+        get_peer=get_discovered_peer,
         event_bus=bus,
         port=args.port,
     )
 
     actual_tcp_port = tcp_service.start()
-    udp_service.tcp_port = actual_tcp_port
+    udp_service = UDPService(
+        peer_id=my_id,
+        peer_name=display_name,
+        tcp_port=actual_tcp_port,
+        event_bus=bus,
+        discovery_ip=str(args.discovery_ip) if args.discovery_ip is not None else None,
+    )
     with app_state.lock:
         app_state.my_tcp_port = actual_tcp_port
 
     def get_media_peer(peer_id):
-        return udp_service.get_peer(peer_id) or tcp_service.get_chat_peer(peer_id)
+        return tcp_service.get_chat_peer(peer_id) or udp_service.get_peer(peer_id)
 
     file_service.configure(
         peer_id=my_id,
@@ -104,7 +107,7 @@ def main():
         event_bus=bus,
     )
     udp_service.start()
-    controller.bind_services(udp_service, tcp_service, file_service)
+    app.controller.bind_services(udp_service, tcp_service, file_service)
 
     app.mainloop()
 

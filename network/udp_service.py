@@ -1,7 +1,7 @@
 """Dịch vụ UDP discovery (HELLO) cho Furina Chat.
 
 Nhiệm vụ:
-- Phát gói HELLO định kỳ tới địa chỉ discovery đã chọn, mặc định là 255.255.255.255:9999.
+- Phát gói HELLO tới địa chỉ discovery đã chọn hoặc các mạng LAN đang kết nối.
 - Lắng nghe HELLO của các peer khác và lưu vào bảng ``_peers``.
 - Quét định kỳ, xóa các peer không gửi HELLO trong thời gian quy định.
 
@@ -14,7 +14,13 @@ Các sự kiện phát ra:
 import socket
 import threading
 import time
+from ipaddress import IPv4Interface
 from typing import Any, Dict, List, Optional
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 import config
 from network import protocol
@@ -55,9 +61,11 @@ class UDPService:
         self._peers: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
+        self._announce_event = threading.Event()
 
         self._sock: Optional[socket.socket] = None
         self._threads: List[threading.Thread] = []
+        self._explicit_discovery = discovery_ip is not None
 
     # ------------------------------------------------------------------
     # Public API
@@ -69,6 +77,7 @@ class UDPService:
 
         self._sock = self._create_socket()
         self._stop_event.clear()
+        self._announce_event.clear()
 
         # Gửi ngay gói HELLO đầu tiên lúc khởi động
         self._send_hello()
@@ -90,6 +99,7 @@ class UDPService:
     def stop(self) -> None:
         """Dừng các luồng nền và đóng socket một cách sạch sẽ."""
         self._stop_event.set()
+        self._announce_event.set()
 
         sock, self._sock = self._sock, None
         if sock is not None:
@@ -113,7 +123,7 @@ class UDPService:
         with self._lock:
             self.status = status
 
-        self._send_hello()
+        self._announce_event.set()
 
     def get_peer(self, peer_id: str) -> Optional[Dict[str, Any]]:
         """Trả về bản sao thông tin peer, hoặc None nếu không tồn tại."""
@@ -146,20 +156,44 @@ class UDPService:
             raise
         return sock
 
-    def _send_hello(self) -> None:
+    def _broadcast_targets(self):
+        if self._explicit_discovery or psutil is None:
+            return {self._hello_target}
+
+        targets = set()
+        try:
+            stats = psutil.net_if_stats()
+            for name, addresses in psutil.net_if_addrs().items():
+                if name not in stats or not stats[name].isup:
+                    continue
+                for address in addresses:
+                    if address.family != socket.AF_INET or not address.netmask:
+                        continue
+                    interface = IPv4Interface((address.address, address.netmask))
+                    if interface.ip.is_loopback or interface.network.prefixlen >= 31:
+                        continue
+                    targets.add((str(interface.network.broadcast_address), config.UDP_DISCOVERY_PORT))
+        except (OSError, ValueError):
+            pass
+        return targets or {self._hello_target}
+
+    def _send_hello(self, target=None) -> None:
         sock = self._sock
         if sock is None:
             return
 
         with self._lock:
             status = self.status
+            peer_targets = {peer["udp_address"] for peer in self._peers.values()}
 
         data = protocol.pack_udp_hello(self.peer_id, self.peer_name, self.tcp_port, status)
-        try:
-            sock.sendto(data, self._hello_target)
-        except OSError:
-            # Mạng chập chờn hoặc chưa kết nối: bỏ qua, luồng vẫn sống
-            pass
+        targets = {target} if target is not None else self._broadcast_targets() | peer_targets
+        for address in targets:
+            try:
+                sock.sendto(data, address)
+            except OSError:
+                # Một tuyến hỏng vẫn cho phép gửi qua các tuyến còn lại.
+                continue
 
     def _publish(self, event_name: str, payload: Dict[str, Any]) -> None:
         if self._event_bus is not None:
@@ -173,9 +207,11 @@ class UDPService:
     # 1. Broadcaster: phát HELLO định kỳ
     # ------------------------------------------------------------------
     def _broadcast_loop(self) -> None:
-        # Gói đầu tiên đã gửi trong start(), chờ 1 chu kỳ rồi phát tiếp
-        while not self._stop_event.wait(config.HELLO_INTERVAL):
-            self._send_hello()
+        while not self._stop_event.is_set():
+            self._announce_event.wait(config.HELLO_INTERVAL)
+            self._announce_event.clear()
+            if not self._stop_event.is_set():
+                self._send_hello()
 
     # ------------------------------------------------------------------
     # 2. Listener: nhận, lọc và cập nhật bảng peer
@@ -188,6 +224,9 @@ class UDPService:
             try:
                 data, addr = sock.recvfrom(config.UDP_RECV_BUFFER_SIZE)
             except socket.timeout:
+                continue
+            except ConnectionResetError:
+                # Windows có thể báo ICMP port unreachable sau một gói unicast.
                 continue
             except OSError:
                 # Socket bị đóng từ stop()
@@ -209,6 +248,7 @@ class UDPService:
             "tcp_port": hello["tcp_port"],
             "status": hello["status"],
             "last_seen": time.monotonic(),
+            "udp_address": addr,
         }
 
         with self._lock:
@@ -221,6 +261,8 @@ class UDPService:
         # Chỉ phát khi peer mới hoặc thông tin/trạng thái thay đổi
         if changed:
             self._publish(config.EVENT_PEER_UPDATED, self._snapshot(peer))
+        if old is None or old["udp_address"] != addr:
+            self._send_hello(addr)
 
     # ------------------------------------------------------------------
     # 3. Sweeper: xóa peer hết hạn (chạy độc lập, không phụ thuộc recvfrom)

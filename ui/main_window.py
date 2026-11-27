@@ -1,4 +1,5 @@
 import gc
+import logging
 import os
 import sys
 import time
@@ -32,6 +33,7 @@ class MainWindow(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._poll_after_id = None
+        self._sidebar_after_id = None
         self._next_ui_collection = None
         self._closing = False
         self._picker_win = None
@@ -153,6 +155,11 @@ class MainWindow(ctk.CTk):
             self.controller.set_activity_status(new_status)
 
     def refresh_sidebar(self):
+        if not self._closing and self._sidebar_after_id is None:
+            self._sidebar_after_id = self.after_idle(self._apply_sidebar)
+
+    def _apply_sidebar(self):
+        self._sidebar_after_id = None
         with self.app_state.lock:
             peers = {str(k): dict(v) for k, v in self.app_state.peers.items()}
             unread = {str(k): v for k, v in self.app_state.unread_counts.items()}
@@ -234,7 +241,10 @@ class MainWindow(ctk.CTk):
             if ev is None:
                 break
             if self.controller and hasattr(self.controller, "process_event"):
-                self.controller.process_event(ev)
+                try:
+                    self.controller.process_event(ev)
+                except Exception:
+                    logging.exception("Could not apply a chat event")
 
         if not self._closing and self.winfo_exists():
             self._poll_after_id = self.after(50, self._poll_event_bus)
@@ -248,6 +258,9 @@ class MainWindow(ctk.CTk):
             except Exception:
                 pass
             self._poll_after_id = None
+        if self._sidebar_after_id is not None:
+            self.after_cancel(self._sidebar_after_id)
+            self._sidebar_after_id = None
 
         if self.controller:
             try:

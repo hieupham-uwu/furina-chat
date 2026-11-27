@@ -1,14 +1,15 @@
+from collections import deque
 from datetime import datetime
+import logging
 import os
+from threading import Lock, Thread
 import time
 import uuid
 import config
 from core.state import state as default_state
-from ui.chat_panel import _get_downloads_dir
 
-SEND_ACK_TIMEOUT = 8.0
 IDLE_AWAY_SECONDS = float(getattr(config, "IDLE_AWAY_SECONDS", 60.0))
-MAX_MSG_CHARS = 4000
+MAX_MSG_CHARS = config.MAX_MESSAGE_LENGTH
 TYPE_MSG = getattr(config, "TYPE_MSG", "MSG")
 TYPE_STICKER = getattr(config, "TYPE_STICKER", "STICKER")
 TYPE_IMAGE = getattr(config, "TYPE_IMAGE", "IMAGE")
@@ -40,10 +41,10 @@ class Controller:
         self.udp_service = None
         self.tcp_service = None
         self.file_service = None
-        self._pending_by_peer = {}
-        self._send_timeout_ids = set()
-        self._auto_selected_latest = False
-        self._last_text_send = None
+        self._pending_messages = {}
+        self._chat_jobs = {}
+        self._chat_lock = Lock()
+        self._closing = False
 
     def bind_services(self, udp_service, tcp_service, file_service):
         self.udp_service = udp_service
@@ -108,25 +109,17 @@ class Controller:
                 ts if ts is not None else time.time()
             )
 
-    def _maybe_auto_select_latest_peer(self):
-        if self._auto_selected_latest:
-            return
+    def _maybe_auto_select_latest_peer(self, connected_peer=None):
         with self.state.lock:
             if self.state.active_peer_id is not None:
-                self._auto_selected_latest = True
                 return
-            candidates = [
-                pid
-                for pid, ts in self.state.last_activity.items()
-                if ts > 0 and len(self.state.chat_history.get(pid, [])) > 0
-            ]
-            if not candidates:
-                return
-            latest_pid = max(
-                candidates, key=lambda k: self.state.last_activity.get(k, 0.0)
+            latest_pid = connected_peer or max(
+                (pid for pid in self.state.last_activity if self.state.chat_history.get(pid)),
+                key=self.state.last_activity.get,
+                default=None,
             )
-        self._auto_selected_latest = True
-        self.select_peer(latest_pid)
+        if latest_pid is not None:
+            self.select_peer(latest_pid)
 
     def select_peer(self, new_peer_id: str):
         if not new_peer_id:
@@ -149,22 +142,15 @@ class Controller:
             peer_status = peer_info.get("status", "online")
 
             history = list(self.state.chat_history.get(pid, []))
-            for m in history:
-                if m.get("is_me") and m.get("delivery_status") in ("Đã gửi", "Đã nhận"):
-                    m["delivery_status"] = "Đã xem"
 
-        if self.tcp_service and hasattr(self.tcp_service, "open_chat"):
-            try:
-                self.tcp_service.open_chat(pid)
-            except Exception as err:
-                self.main_window.chat_panel.show_error(f"Cảnh báo: {err}")
-
+        self.main_window.chat_panel.hide_error()
         self.main_window.chat_panel.set_header(
             f"Đang chat với: {peer_name}", status=peer_status
         )
         self.main_window.chat_panel.set_current_input(restored_draft)
         self.main_window.chat_panel.render_messages(history)
         self.main_window.refresh_sidebar()
+        self._queue_chat(pid)
 
     def change_my_name(self, new_name: str):
         clean_name = (new_name or "").strip()
@@ -204,33 +190,46 @@ class Controller:
         msg_obj["delivery_status"] = "Chưa gửi được"
         self.main_window.safe_update_status(peer_id, msg_obj["msg_id"], "Chưa gửi được")
 
-    def _schedule_unsent_timeout(self, peer_id: str, msg_obj: dict, timeout: float):
-        def _timer():
-            self._send_timeout_ids.discard(after_id)
-            self._mark_unsent(peer_id, msg_obj)
+    def _queue_chat(self, peer_id, send=None, msg_obj=None, args=()):
+        if self.tcp_service is None or self.event_bus is None:
+            if msg_obj is not None:
+                self._mark_unsent(peer_id, msg_obj)
+            return
 
-        after_id = self.main_window.after(round(timeout * 1000), _timer)
-        self._send_timeout_ids.add(after_id)
+        with self._chat_lock:
+            if self._closing:
+                return
+            msg_id = msg_obj["msg_id"] if msg_obj is not None else None
+            if msg_id is not None:
+                self._pending_messages[msg_id] = msg_obj
+            if peer_id in self._chat_jobs:
+                if send is not None:
+                    self._chat_jobs[peer_id].append((send, msg_id, args))
+                return
+            self._chat_jobs[peer_id] = deque([(send, msg_id, args)])
 
-    def _dispatch_send(
-        self, peer_id: str, msg_obj: dict, fn_names: tuple, args: tuple, timeout: float
-    ):
-        self._schedule_unsent_timeout(peer_id, msg_obj, timeout)
-        for svc in (self.tcp_service, self.file_service):
-            if svc is None:
-                continue
-            for fn_name in fn_names:
-                fn = getattr(svc, fn_name, None)
-                if callable(fn):
-                    try:
-                        res = fn(*args)
-                        if res is False:
-                            self._mark_unsent(peer_id, msg_obj)
-                        return res
-                    except Exception:
-                        self._mark_unsent(peer_id, msg_obj)
-                        return None
-        return None
+        Thread(target=self._drain_chat_jobs, args=(peer_id,), daemon=True).start()
+
+    def _drain_chat_jobs(self, peer_id):
+        while True:
+            with self._chat_lock:
+                jobs = self._chat_jobs.get(peer_id)
+                if not jobs or self._closing:
+                    self._chat_jobs.pop(peer_id, None)
+                    return
+                send, msg_id, args = jobs.popleft()
+
+            sent = False
+            try:
+                self.tcp_service.open_chat(peer_id)
+                if send is not None:
+                    sent = getattr(self.tcp_service, send)(peer_id, *args)
+            except Exception:
+                logging.exception("Chat operation failed for peer %s", peer_id)
+            if msg_id is not None:
+                self.event_bus.publish("outgoing_chat_result", {
+                    "msg_id": msg_id, "peer_id": peer_id, "sent": sent,
+                })
 
     def send_text_message(self, text: str):
         self.record_user_activity(auto_back_online=True)
@@ -240,20 +239,10 @@ class Controller:
             )
             return
 
-        now_ts = time.time()
         with self.state.lock:
             active_id = self.state.active_peer_id
             my_id = self.state.my_peer_id
             my_name = self.state.my_name
-            last_send = getattr(self, "_last_text_send", None)
-            if (
-                last_send
-                and last_send[0] == active_id
-                and last_send[1] == text
-                and (now_ts - last_send[2]) < 0.5
-            ):
-                return
-            self._last_text_send = (active_id, text, now_ts)
 
         if not active_id:
             return
@@ -276,17 +265,10 @@ class Controller:
             self.state.chat_history.setdefault(active_id, []).append(msg_obj)
             self.state.drafts[active_id] = ""
             self._touch_activity(active_id)
-        self._pending_by_peer.setdefault(active_id, []).append(msg_obj)
 
         self.main_window.chat_panel.append_single_message(msg_obj)
         self.main_window.refresh_sidebar()
-        self._dispatch_send(
-            active_id,
-            msg_obj,
-            ("send_message", "send_text"),
-            (active_id, text),
-            SEND_ACK_TIMEOUT,
-        )
+        self._queue_chat(active_id, "send_message", msg_obj, (text,))
 
     def send_sticker(self, pack: str, sticker_id: str):
         self.record_user_activity(auto_back_online=True)
@@ -316,17 +298,10 @@ class Controller:
         with self.state.lock:
             self.state.chat_history.setdefault(active_id, []).append(msg_obj)
             self._touch_activity(active_id)
-        self._pending_by_peer.setdefault(active_id, []).append(msg_obj)
 
         self.main_window.chat_panel.append_single_message(msg_obj)
         self.main_window.refresh_sidebar()
-        self._dispatch_send(
-            active_id,
-            msg_obj,
-            ("send_sticker",),
-            (active_id, pack, sticker_id),
-            SEND_ACK_TIMEOUT,
-        )
+        self._queue_chat(active_id, "send_sticker", msg_obj, (pack, sticker_id))
 
     def send_file(self, file_path: str, media_type: str = TYPE_FILE):
         self.record_user_activity(auto_back_online=True)
@@ -368,7 +343,6 @@ class Controller:
         with self.state.lock:
             self.state.chat_history.setdefault(active_id, []).append(msg_obj)
             self._touch_activity(active_id)
-        self._pending_by_peer.setdefault(active_id, []).append(msg_obj)
 
         self.main_window.chat_panel.append_single_message(msg_obj)
         self.main_window.refresh_sidebar()
@@ -395,28 +369,6 @@ class Controller:
                 "msg_obj": msg_obj,
             }
 
-    def _cleanup_failed_transfer_files(self, fname: str, local_path: str = ""):
-        dl_dir = _get_downloads_dir()
-        candidates = set()
-        if local_path:
-            candidates.add(local_path)
-            candidates.add(local_path + ".part")
-        if fname and os.path.isdir(dl_dir):
-            base_target = os.path.join(dl_dir, os.path.basename(fname))
-            candidates.add(base_target + ".part")
-            for entry in os.listdir(dl_dir):
-                if entry.endswith(".part") and (
-                    not fname or os.path.basename(fname) in entry
-                ):
-                    candidates.add(os.path.join(dl_dir, entry))
-
-        for path in candidates:
-            if path and os.path.isfile(path):
-                try:
-                    os.remove(path)
-                except Exception:
-                    pass
-
     def process_event(self, event):
         etype, data = _unpack_event(event)
         if not etype:
@@ -425,7 +377,7 @@ class Controller:
         if etype in (
             "peer_updated",
             getattr(config, "EVENT_PEER_UPDATED", "peer_updated"),
-        ):
+        ) or (etype == "chat_connected" and data.get("ip")):
             raw_pid = data.get("peer_id")
             if not raw_pid:
                 return
@@ -452,17 +404,22 @@ class Controller:
                 self.main_window.chat_panel.set_header(
                     f"Đang chat với: {peer_name}", status=peer_status
                 )
-            self._maybe_auto_select_latest_peer()
+            self._maybe_auto_select_latest_peer(pid if etype == "chat_connected" else None)
             self.main_window.refresh_sidebar()
 
         elif etype in (
             "peer_offline",
             getattr(config, "EVENT_PEER_OFFLINE", "peer_offline"),
+            "chat_disconnected",
         ):
             raw_pid = data.get("peer_id")
             if not raw_pid:
                 return
             pid = str(raw_pid)
+            if self.udp_service and self.udp_service.get_peer(pid):
+                return
+            if self.tcp_service and self.tcp_service.get_chat_peer(pid):
+                return
             with self.state.lock:
                 existing = dict(self.state.peers.get(pid, {}))
                 existing["peer_id"] = pid
@@ -480,24 +437,17 @@ class Controller:
                 )
             self.main_window.refresh_sidebar()
 
-        elif etype in ("message_sent", "sticker_sent"):
-            raw_pid = data.get("peer_id")
-            pid = str(raw_pid) if raw_pid else None
-            if data.get("error") or data.get("failed"):
-                pending = self._pending_by_peer.get(pid, [])
-                for m in reversed(pending):
-                    if not m.get("acked"):
-                        self._mark_unsent(pid, m)
-                        break
+        elif etype == "outgoing_chat_result":
+            msg = self._pending_messages.pop(data["msg_id"], None)
+            if msg is None:
                 return
-
-            pending = self._pending_by_peer.get(pid, [])
-            for m in reversed(pending):
-                if not m.get("acked"):
-                    m["acked"] = True
-                    m["delivery_status"] = "Đã gửi"
-                    self.main_window.safe_update_status(pid, m["msg_id"], "Đã gửi")
-                    break
+            pid = data["peer_id"]
+            if data["sent"]:
+                msg["acked"] = True
+                msg["delivery_status"] = "Đã gửi"
+                self.main_window.safe_update_status(pid, msg["msg_id"], "Đã gửi")
+            else:
+                self._mark_unsent(pid, msg)
 
         elif etype in ("message_received", "sticker_received"):
             raw_pid = data.get("peer_id")
@@ -543,10 +493,7 @@ class Controller:
                     )
 
             self._maybe_auto_select_latest_peer()
-            with self.state.lock:
-                is_active_now = pid == self.state.active_peer_id
-
-            if is_active_now:
+            if is_active:
                 self.main_window.chat_panel.append_single_message(msg)
             self.main_window.refresh_sidebar()
 
@@ -661,10 +608,13 @@ class Controller:
                         "Đã gửi" if direction == "send" else "Đã nhận"
                     )
                 is_active = pid == self.state.active_peer_id
-                history = list(self.state.chat_history.get(pid, [])) if is_active else []
+                history = list(self.state.chat_history.get(pid, [])) if is_active and direction == "receive" else []
 
             if is_active:
-                self.main_window.chat_panel.render_messages(history)
+                if direction == "receive":
+                    self.main_window.chat_panel.render_messages(history)
+                elif msg_obj:
+                    self.main_window.chat_panel.update_message_status(msg_obj["msg_id"], "Đã gửi")
                 self.main_window.chat_panel.update_progress(1.0, f"Hoàn tất {fname}")
 
         elif etype in (
@@ -673,19 +623,15 @@ class Controller:
         ):
             tid = data.get("transfer_id")
             reason = data.get("reason") or "Truyền tệp thất bại"
-            local_path = data.get("local_path") or ""
 
             with self.state.lock:
                 tr = self.state.transfers.get(tid, {})
                 raw_pid = data.get("peer_id") or tr.get("peer_id")
                 pid = str(raw_pid) if raw_pid else None
-                fname = data.get("filename") or tr.get("filename") or ""
                 msg_obj = tr.get("msg_obj")
                 if msg_obj:
                     msg_obj["delivery_status"] = "Chưa gửi được"
                 is_active = pid == self.state.active_peer_id
-
-            self._cleanup_failed_transfer_files(fname, local_path=local_path)
 
             if msg_obj and msg_obj.get("msg_id") and is_active:
                 self.main_window.chat_panel.update_message_status(
@@ -695,23 +641,19 @@ class Controller:
                 self.main_window.chat_panel.update_progress(1.0, "Lỗi truyền tệp")
                 self.main_window.chat_panel.show_error(f"Cảnh báo: {reason}")
 
-        elif etype in ("send_failed", "message_failed"):
-            raw_pid = data.get("peer_id")
-            pid = str(raw_pid) if raw_pid else None
-            pending = self._pending_by_peer.get(pid, [])
-            for m in reversed(pending):
-                if not m.get("acked"):
-                    self._mark_unsent(pid, m)
-                    break
-
         elif etype == "operation_failed":
+            with self.state.lock:
+                active_id = self.state.active_peer_id
+            if data.get("peer_id") and data["peer_id"] != active_id:
+                return
             reason = data.get("reason") or "Thao tác thất bại"
             self.main_window.chat_panel.show_error(f"Cảnh báo: {reason}")
 
     def shutdown(self):
-        for after_id in self._send_timeout_ids:
-            self.main_window.after_cancel(after_id)
-        self._send_timeout_ids.clear()
+        with self._chat_lock:
+            self._closing = True
+            self._chat_jobs.clear()
+        self._pending_messages.clear()
         if self.file_service and hasattr(self.file_service, "stop"):
             try:
                 self.file_service.stop()

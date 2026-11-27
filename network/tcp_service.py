@@ -306,7 +306,8 @@ class TCPService:
             address = (peer["ip"], peer["tcp_port"])
             reply = _connect_and_exchange_hi(sock, address, local_peer, peer_id)
             peer_address = (sock.getpeername()[0], reply["tcp_port"])
-            chat = self._register_chat(peer_id, sock, peer_address, outgoing=True)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            chat = self._register_chat(peer_id, reply["name"], sock, peer_address, outgoing=True)
 
             if chat is None:
                 self._discard_socket(sock)
@@ -332,30 +333,32 @@ class TCPService:
 
     def send_message(self, peer_id, text):
         """Gửi một frame MSG qua kết nối đang dùng với peer."""
-        self._send_on_chat(peer_id, "send_message", send_chat_message, text)
+        return self._send_on_chat(peer_id, "send_message", send_chat_message, text)
 
     def send_sticker(self, peer_id, pack, sticker_id):
         """Gửi mã sticker qua kết nối chat để bên nhận tra ảnh cục bộ."""
-        self._send_on_chat(peer_id, "send_sticker", _send_chat_sticker, pack, sticker_id)
+        return self._send_on_chat(peer_id, "send_sticker", _send_chat_sticker, pack, sticker_id)
 
     def _send_on_chat(self, peer_id, operation, send_frame, *fields):
         chat = self._get_chat(peer_id)
         if chat is None:
             self._failed(operation, peer_id, "Chat is not connected")
-            return
+            return False
 
         # MSG và STICKER dùng cùng khóa gửi với BYE.
         with chat.send_lock:
             if self._get_chat(peer_id) is not chat:
                 self._failed(operation, peer_id, "Chat connection changed")
-                return
+                return False
             try:
                 send_frame(chat.sock, peer_id, *fields, bus=self._bus)
+                return True
             except ValueError as error:
                 self._failed(operation, peer_id, error)
             except OSError as error:
                 self._failed(operation, peer_id, error)
                 self._disconnect(peer_id, chat, str(error))
+        return False
 
     def leave_chat(self, peer_id):
         """Gửi BYE trước khi đóng kết nối chat."""
@@ -414,9 +417,11 @@ class TCPService:
             peer_id = greeting["peer_id"]
             if peer_id == self.peer_id:
                 raise ValueError("Cannot open chat with yourself")
+            peer_address = (sock.getpeername()[0], greeting["tcp_port"])
 
             if greeting["purpose"] == config.HI_PURPOSE_MEDIA:
                 # Kết nối media đi một chiều: không trả HI, không đăng ký chat.
+                file_service.remember_peer(peer_id, *peer_address)
                 self._handoff_media(sock, peer_id)
                 return
 
@@ -424,7 +429,7 @@ class TCPService:
             sock.settimeout(config.HI_FRAME_TIMEOUT)
             send_chat_hi(sock, local_id, local_name, local_port)
             sock.settimeout(None)
-            peer_address = (sock.getpeername()[0], greeting["tcp_port"])
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except (OSError, EOFError, ValueError) as error:
             with self._lock:
                 if sock in self._sockets:
@@ -432,7 +437,7 @@ class TCPService:
             self._discard_socket(sock)
             return
 
-        chat = self._register_chat(peer_id, sock, peer_address, outgoing=False)
+        chat = self._register_chat(peer_id, greeting["name"], sock, peer_address, outgoing=False)
         if chat is None:
             self._discard_socket(sock)
             return
@@ -448,7 +453,7 @@ class TCPService:
                 # file_service đã đóng socket, TCP chỉ cần quên nó đi.
                 self._sockets.discard(sock)
 
-    def _register_chat(self, peer_id, sock, peer_address, outgoing):
+    def _register_chat(self, peer_id, name, sock, peer_address, outgoing):
         chat = _ChatConnection(sock, outgoing, peer_address)
         with self._lock:
             if sock not in self._sockets:
@@ -463,7 +468,10 @@ class TCPService:
 
             self._chats[peer_id] = chat
             if old_chat is None:
-                self._bus.publish("chat_connected", {"peer_id": peer_id})
+                ip, tcp_port = peer_address
+                self._bus.publish("chat_connected", {
+                    "peer_id": peer_id, "name": name, "ip": ip, "tcp_port": tcp_port,
+                })
 
         if old_chat is not None:
             self._discard_socket(old_chat.sock)

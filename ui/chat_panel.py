@@ -1,13 +1,14 @@
 import os
 import platform
 import subprocess
-from tkinter import filedialog
+from textwrap import wrap
+from tkinter import TclError, filedialog
 import customtkinter as ctk
 from PIL import Image, ImageDraw
 import config
 from ui.sticker_picker import _get_stickers_dir
 
-MAX_MSG_CHARS = 4000
+MAX_MSG_CHARS = config.MAX_MESSAGE_LENGTH
 TYPE_MSG = getattr(config, "TYPE_MSG", "MSG")
 TYPE_STICKER = getattr(config, "TYPE_STICKER", "STICKER")
 TYPE_IMAGE = getattr(config, "TYPE_IMAGE", "IMAGE")
@@ -95,7 +96,8 @@ class ChatPanel(ctk.CTkFrame):
         self.my_avatar = my_avatar
         self._image_cache = []
         self._status_labels = {}
-        self._sending_text = False
+        self._scroll_after_id = None
+        self._empty_history_label = None
 
         self.header_bar = ctk.CTkFrame(
             self, fg_color="#FFFFFF", corner_radius=14, height=42
@@ -232,17 +234,20 @@ class ChatPanel(ctk.CTkFrame):
         )
         self.btn_sticker.pack(side="left", padx=(2, 4), pady=3)
 
-        self.entry_msg = ctk.CTkEntry(
+        self.entry_msg = ctk.CTkTextbox(
             self.input_frame,
-            height=40,
+            height=44,
             corner_radius=20,
             fg_color="#FFFFFF",
             border_width=0,
             text_color="#1F2937",
-            placeholder_text="Aa (tối đa 4000 ký tự)",
+            wrap="word",
         )
         self.entry_msg.pack(side="left", fill="x", expand=True, padx=(0, 8))
         self.entry_msg.bind("<Return>", self._on_return)
+        self.entry_msg.bind("<Control-v>", self._paste_text)
+        self.entry_msg.bind("<<Paste>>", self._paste_text)
+        self.entry_msg.bind("<KeyPress>", self._limit_input)
 
         self.btn_send = ctk.CTkButton(
             self.input_frame,
@@ -305,21 +310,48 @@ class ChatPanel(ctk.CTkFrame):
             self.error_banner.pack_forget()
 
     def get_current_input(self) -> str:
-        return self.entry_msg.get()
+        return self.entry_msg.get("1.0", "end-1c")
 
     def set_current_input(self, text: str):
-        self.entry_msg.delete(0, "end")
+        self.entry_msg.delete("1.0", "end")
         if text:
-            self.entry_msg.insert(0, text)
+            self.entry_msg.insert("1.0", text[:MAX_MSG_CHARS])
+
+    def _available_input(self, entry):
+        selection = entry.tag_ranges("sel")
+        selected = entry.get(*selection) if selection else ""
+        return max(0, MAX_MSG_CHARS - len(self.get_current_input()) + len(selected))
+
+    def _limit_input(self, event):
+        if event.char.isprintable() and len(event.char) > self._available_input(event.widget):
+            return "break"
+
+    def _paste_text(self, event):
+        entry = event.widget
+        try:
+            pasted = entry.clipboard_get()
+        except TclError:
+            return "break"
+
+        available = self._available_input(entry)
+        if pasted and available:
+            selection = entry.tag_ranges("sel")
+            if selection:
+                entry.delete(*selection)
+                entry.mark_set("insert", selection[0])
+            entry.insert("insert", pasted[:available])
+            if self.controller:
+                self.controller.record_user_activity(auto_back_online=True)
+        if len(pasted) > available:
+            self.show_error(f"Ô nhập chỉ chứa tối đa {MAX_MSG_CHARS} ký tự.")
+        return "break"
 
     def _on_return(self, _event):
         self._send_text()
         return "break"
 
     def _send_text(self):
-        if getattr(self, "_sending_text", False):
-            return
-        raw_text = self.entry_msg.get()
+        raw_text = self.get_current_input()
         if len(raw_text) > MAX_MSG_CHARS:
             self.show_error(
                 f"Tin nhắn vượt quá giới hạn {MAX_MSG_CHARS} ký tự ({len(raw_text)}/{MAX_MSG_CHARS})."
@@ -332,14 +364,10 @@ class ChatPanel(ctk.CTkFrame):
             self.show_error("Hãy chọn một người để chat.")
             return
 
-        self._sending_text = True
-        try:
-            self.hide_error()
-            self.entry_msg.delete(0, "end")
-            self.entry_msg.focus_set()
-            self.controller.send_text_message(text)
-        finally:
-            self.after(150, lambda: setattr(self, "_sending_text", False))
+        self.hide_error()
+        self.set_current_input("")
+        self.entry_msg.focus_set()
+        self.controller.send_text_message(text)
 
     def _on_sticker_button_click(self):
         if not (self.controller and self.controller.has_active_peer()):
@@ -406,13 +434,21 @@ class ChatPanel(ctk.CTkFrame):
         return None
 
     def render_messages(self, history: list):
+        self.messages_scroll._parent_canvas.yview_moveto(0)
         self._image_cache.clear()
         self._status_labels.clear()
         for child in self.messages_scroll.winfo_children():
             child.destroy()
+        self._empty_history_label = None
 
         for msg in history:
             self.append_single_message(msg)
+        if not history:
+            self._empty_history_label = ctk.CTkLabel(
+                self.messages_scroll, text="Chưa có tin nhắn", text_color="#6B7280",
+            )
+            self._empty_history_label.pack(pady=16)
+        self._scroll_to_bottom()
 
     def update_message_status(self, msg_id: str, delivery_status: str):
         lbl = self._status_labels.get(msg_id)
@@ -425,6 +461,9 @@ class ChatPanel(ctk.CTkFrame):
             lbl.configure(text=delivery_status, text_color=color)
 
     def append_single_message(self, msg: dict):
+        if self._empty_history_label is not None:
+            self._empty_history_label.destroy()
+            self._empty_history_label = None
         sender_name = msg.get("sender_name") or msg.get("sender") or "Unknown"
         msg_type = (msg.get("type") or TYPE_MSG).upper()
         is_me = bool(msg.get("is_me", False))
@@ -463,12 +502,21 @@ class ChatPanel(ctk.CTkFrame):
             bubble = ctk.CTkFrame(row_container, fg_color=bubble_fg, corner_radius=14)
             bubble.pack(anchor=anchor, fill="none")
 
+            text = msg.get("text", "")
+            wraplength = 440
+            if len(text) > 500:
+                # Keep Tk from measuring a single very long line on Windows.
+                wraplength = 0
+                text = "\n".join(
+                    "\n".join(wrap(line, width=28, replace_whitespace=False, drop_whitespace=False))
+                    for line in text.split("\n")
+                )
             ctk.CTkLabel(
                 bubble,
-                text=msg.get("text", ""),
+                text=text,
                 font=("Segoe UI", 12),
                 text_color=text_fg,
-                wraplength=440,
+                wraplength=wraplength,
                 justify="left",
             ).pack(anchor="w", padx=12, pady=7)
 
@@ -608,10 +656,17 @@ class ChatPanel(ctk.CTkFrame):
         self._scroll_to_bottom()
 
     def _scroll_to_bottom(self):
-        try:
-            self.messages_scroll._parent_canvas.yview_moveto(1.0)
-        except Exception:
-            pass
+        if self._scroll_after_id is None:
+            self._scroll_after_id = self.after_idle(self._apply_history_scroll)
+
+    def _apply_history_scroll(self):
+        self.messages_scroll.update_idletasks()
+        self._scroll_after_id = None
+        canvas = self.messages_scroll._parent_canvas
+        bounds = canvas.bbox("all")
+        if bounds:
+            canvas.configure(scrollregion=bounds)
+            canvas.yview_moveto(1.0 if bounds[3] - bounds[1] > canvas.winfo_height() else 0.0)
 
     def update_progress(self, percent: float, text: str):
         clamped = max(0.0, min(1.0, float(percent)))
