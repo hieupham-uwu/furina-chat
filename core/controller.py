@@ -348,6 +348,15 @@ class Controller:
                 peer.update({k: v for k, v in data.items() if v is not None})
                 peer["status"] = data.get("status") or config.STATUS_ONLINE
                 state.peers[pid] = peer
+
+            if self.file_service and hasattr(self.file_service, "remember_peer"):
+                try:
+                    self.file_service.remember_peer(
+                        pid, peer.get("ip"), peer.get("tcp_port")
+                    )
+                except Exception:
+                    pass
+
             self.main_window.refresh_sidebar()
 
         elif etype == "peer_offline":

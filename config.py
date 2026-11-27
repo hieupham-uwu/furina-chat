@@ -123,6 +123,12 @@ DOWNLOADS_DIR_NAME = "downloads"
 # Thời gian chờ tối đa khi join luồng gửi file (giây)
 FILE_JOIN_TIMEOUT: float = 2.0
 
+# Số lần thử mở kết nối media khi connect thất bại tạm thời
+FILE_CONNECT_ATTEMPTS: int = 3
+
+# Thời gian chờ trước mỗi lần thử lại, nhân với số thứ tự lần thử (giây)
+FILE_RETRY_BACKOFF: float = 0.5
+
 
 # ==============================================================================
 # 7. Thời gian chờ (Timeouts)
